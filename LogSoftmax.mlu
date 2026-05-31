@@ -1,0 +1,176 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <math.h>
+#include <float.h>
+
+#define FEAT_TILE 4096
+
+__mlu_entry__ void logsoftmax_kernel(
+    float* input,
+    float* output,
+    int batch,
+    int feat) {
+
+    int row = taskId;
+
+    if (row >= batch) {
+        return;
+    }
+
+    __nram__ float nram_tile[FEAT_TILE];
+    __nram__ float nram_argmax_result[2];
+
+    // Pass 1: row max
+    float row_max = -FLT_MAX;
+
+    for (int f0 = 0; f0 < feat; f0 += FEAT_TILE) {
+
+        int tile =
+            (f0 + FEAT_TILE < feat)
+                ? FEAT_TILE
+                : (feat - f0);
+
+        __memcpy(
+            nram_tile,
+            input + row * feat + f0,
+            tile * sizeof(float),
+            GDRAM2NRAM);
+
+        __bang_argmax(
+            nram_argmax_result,
+            nram_tile,
+            tile);
+
+        float tile_max = nram_argmax_result[0];
+
+        if (tile_max > row_max) {
+            row_max = tile_max;
+        }
+    }
+
+    // Pass 2: sum(exp(x-max))
+    float sum_total = 0.0f;
+
+    for (int f0 = 0; f0 < feat; f0 += FEAT_TILE) {
+
+        int tile =
+            (f0 + FEAT_TILE < feat)
+                ? FEAT_TILE
+                : (feat - f0);
+
+        __memcpy(
+            nram_tile,
+            input + row * feat + f0,
+            tile * sizeof(float),
+            GDRAM2NRAM);
+
+        __bang_fusion(
+            FUSION_FSA,
+            nram_tile,
+            nram_tile,
+            0.0f,
+            -row_max,
+            tile);
+
+        __bang_active_exp(
+            nram_tile,
+            nram_tile,
+            tile);
+
+        sum_total += __bang_sum(
+            nram_tile,
+            tile);
+    }
+
+    float log_sum = logf(sum_total);
+
+    // Pass 3: x - row_max - log_sum
+    float shift = -(row_max + log_sum);
+
+    for (int f0 = 0; f0 < feat; f0 += FEAT_TILE) {
+
+        int tile =
+            (f0 + FEAT_TILE < feat)
+                ? FEAT_TILE
+                : (feat - f0);
+
+        __memcpy(
+            nram_tile,
+            input + row * feat + f0,
+            tile * sizeof(float),
+            GDRAM2NRAM);
+
+        __bang_fusion(
+            FUSION_FSA,
+            nram_tile,
+            nram_tile,
+            0.0f,
+            shift,
+            tile);
+
+        __memcpy(
+            output + row * feat + f0,
+            nram_tile,
+            tile * sizeof(float),
+            NRAM2GDRAM);
+    }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor input,
+    int dim) {
+
+    TORCH_CHECK(
+        input.is_contiguous(),
+        "Input must be contiguous");
+
+    TORCH_CHECK(
+        dim == 1,
+        "Only dim=1 is supported");
+
+    auto original_dtype =
+        input.scalar_type();
+
+    torch::Tensor input_fp32 =
+        input;
+
+    if (original_dtype != torch::kFloat) {
+        input_fp32 =
+            input.to(torch::kFloat);
+    }
+
+    auto output_fp32 =
+        torch::empty_like(input_fp32);
+
+    int batch =
+        input_fp32.size(0);
+
+    int feat =
+        input_fp32.size(1);
+
+    cnrtQueue_t queue =
+        torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t kdim = {
+        (unsigned int)batch,
+        1,
+        1
+    };
+
+    cnrtFunctionType_t ktype =
+        cnrtFuncTypeBlock;
+
+    logsoftmax_kernel<<<kdim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch,
+        feat);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(
+            original_dtype);
+    }
+
+    return output_fp32;
+}
