@@ -11,16 +11,19 @@ __mlu_entry__ void sqrt_kernel(
 
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
+
     uint32_t per_core = total / core_num;
     uint32_t remainder = total % core_num;
 
-    uint32_t start = core_id * per_core +
-                     (core_id < remainder ? core_id : remainder);
+    uint32_t start =
+        core_id * per_core +
+        (core_id < remainder ? core_id : remainder);
 
-    uint32_t count = per_core +
-                     (core_id < remainder ? 1 : 0);
+    uint32_t count =
+        per_core +
+        (core_id < remainder ? 1 : 0);
 
-    __nram__ half nram[CHUNK_SIZE];
+    __nram__ half buf[CHUNK_SIZE];
 
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
 
@@ -29,52 +32,58 @@ __mlu_entry__ void sqrt_kernel(
                 ? CHUNK_SIZE
                 : (count - offset);
 
+        // BangC 的 __bang_active_* 函数通常要求 len 是 64 的倍数
+        uint32_t aligned_len = (len + 63) & ~63;
+
         __memcpy(
-            nram,
+            buf,
             input + start + offset,
             len * sizeof(half),
             GDRAM2NRAM);
 
-        // abs(x)
-        __bang_active_abs(nram, nram, len);
-        // sqrt(abs(x))
-        __bang_active_sqrt(nram, nram, len);
+        // 先 abs，再 sqrt —— 对应 torch.sqrt(torch.abs(x))
+        __bang_active_abs(buf, buf, aligned_len);
+        __bang_active_sqrt(buf, buf, aligned_len);
 
         __memcpy(
             output + start + offset,
-            nram,
+            buf,
             len * sizeof(half),
             NRAM2GDRAM);
     }
 }
 
-torch::Tensor bang_func(torch::Tensor x) {
-    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+at::Tensor bang_func(at::Tensor input) {
 
-    auto original_dtype = x.scalar_type();
-    torch::Tensor input_fp16 = x;
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
 
-    // 确保输入是 half 类型
-    if (original_dtype != torch::kHalf) {
-        input_fp16 = x.to(torch::kHalf);
+    auto x = input;
+    auto dtype = input.scalar_type();
+
+    // 题目要求 float16，但测试框架可能传入其他类型，统一转 half
+    if (dtype != at::kHalf) {
+        x = input.to(at::kHalf);
     }
 
-    auto output_fp16 = torch::empty_like(input_fp16);
-    int total = input_fp16.numel();
+    auto out = at::empty_like(x);
+    int total = x.numel();
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     sqrt_kernel<<<dim, ktype, queue>>>(
-        input_fp16.data_ptr<<at::Half>(),
-        output_fp16.data_ptr<<at::Half>(),
-        total
-    );
+        reinterpret_cast<half*>(x.data_ptr<<at::Half>()),
+        reinterpret_cast<half*>(out.data_ptr<<at::Half>()),
+        total);
 
-    // 如果原始类型不是 half，转回去
-    if (original_dtype != torch::kHalf) {
-        return output_fp16.to(original_dtype);
+    // 同步确保计算完成
+    cnrtSyncQueue(queue);
+
+    if (dtype != at::kHalf) {
+        return out.to(dtype);
     }
-    return output_fp16;
+
+    return out;
 }
