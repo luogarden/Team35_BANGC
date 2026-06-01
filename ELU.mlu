@@ -4,40 +4,7 @@
 
 #define CHUNK_SIZE 4096
 
-__mlu_func__ float fast_exp(float x) {
-    if (x < -87.3f) {
-        return 0.0f;
-    }
-    if (x > 87.3f) {
-        x = 87.3f;
-    }
-
-    const float inv_ln2 = 1.44269504088896341f;
-    const float ln2_hi = 0.693359375f;
-    const float ln2_lo = -0.00021217204052209854f;
-
-    float kf = x * inv_ln2;
-    int k = (int)(kf + (kf >= 0.0f ? 0.5f : -0.5f));
-    float r = x - (float)k * ln2_hi - (float)k * ln2_lo;
-
-    float r2 = r * r;
-    float p = 1.0f + r * (1.0f + r * (0.5f +
-              r * (0.16666667163372039795f +
-              r * (0.04166668280959129333f +
-              r * (0.00833333097338676453f +
-              r * (0.00138889296869188547f +
-              r * (0.00019841069537773788f +
-              r * 0.000024793375991914592f)))))));
-
-    union {
-        float f;
-        unsigned int u;
-    } result;
-    result.u = (unsigned int)(k + 127) << 23;
-    return p * result.f;
-}
-
-__mlu_func__ float expm1(float x) {
+__mlu_func__ float fast_expm1(float x) {
     if (x < -17.0f) {
         return -1.0f;
     }
@@ -50,7 +17,6 @@ __mlu_func__ float expm1(float x) {
     int k = (int)(kf + (kf >= 0.0f ? 0.5f : -0.5f));
     float r = x - (float)k * ln2_hi - (float)k * ln2_lo;
 
-    float r2 = r * r;
     float p = r * (1.0f + r * (0.5f +
               r * (0.16666667163372039795f +
               r * (0.04166668280959129333f +
@@ -122,7 +88,7 @@ __mlu_entry__ void elu_kernel(
         for (uint32_t i = 0; i < len; i++) {
             float x = nram_neg[i];
             if (x < 0.0f) {
-                nram_neg[i] = alpha * expm1(x);
+                nram_neg[i] = alpha * fast_expm1(x);
             } else {
                 nram_neg[i] = 0.0f;
             }
