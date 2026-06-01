@@ -120,4 +120,3 @@ torch::Tensor bang_func(
 
     return output_fp32;
 }
-
