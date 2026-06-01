@@ -1,24 +1,50 @@
-#include <torch/extension.h>
-#include <cmath>
+#include <bang.h>
 
-at::Tensor bang_func(at::Tensor input) {
+#define CHUNK_SIZE 4096
 
-    auto x = input.to(at::kFloat);
-    auto out = at::empty_like(x);
+__mlu_entry__ void sqrt_kernel(
+    half *input,
+    half *output,
+    int total) {
 
-    auto x_ptr = x.data_ptr<float>();
-    auto out_ptr = out.data_ptr<float>();
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total / core_num;
+    uint32_t remainder = total % core_num;
 
-    int64_t n = x.numel();
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
 
-    for (int64_t i = 0; i < n; i++) {
-        float v = x_ptr[i];
-        out_ptr[i] = v > 0 ? std::sqrt(v) : 0.0f;
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
+
+    __nram__ half nram[CHUNK_SIZE];
+
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
+
+        uint32_t len =
+            (offset + CHUNK_SIZE <= count)
+                ? CHUNK_SIZE
+                : (count - offset);
+
+        __memcpy(
+            nram,
+            input + start + offset,
+            len * sizeof(half),
+            GDRAM2NRAM);
+
+        for (uint32_t i = 0; i < len; i++) {
+            // 先取绝对值，再求平方根
+            // BangC 提供 __fabs 和 __sqrt 内置函数
+            float val = (float)nram[i];
+            val = __fabsf(val);
+            nram[i] = (half)__sqrtf(val);
+        }
+
+        __memcpy(
+            output + start + offset,
+            nram,
+            len * sizeof(half),
+            NRAM2GDRAM);
     }
-
-    return out;
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("bang_func", &bang_func, "sqrt kernel");
 }
