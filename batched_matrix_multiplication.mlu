@@ -38,14 +38,14 @@ __mlu_entry__ void bmm_kernel(
         int m_size = (row_start + M_TILE <= m) ? M_TILE : (m - row_start);
         int n_size = (col_start + N_TILE <= n) ? N_TILE : (n - col_start);
 
-        // 结果累加缓存满尺寸一键清零
+        // 满片一键清零结果累加器
         __bang_write_value(accum_nram, M_TILE * N_TILE, 0.0f);
 
         for (int kt = 0; kt < k_tiles; ++kt) {
             int k_start = kt * K_TILE;
             int k_size = (k_start + K_TILE <= k) ? K_TILE : (k - k_start);
 
-            // 1. 搬运左矩阵 A 片段：始终保持固定跨步 K_TILE 并用 NRAM 指令一键安全补零
+            // 1. 搬运左矩阵 A 并安全片上刷零（隔离纵向 K 轴污染）
             __bang_write_value(left_nram, M_TILE * K_TILE, 0.0f);
             for (int row = 0; row < m_size; ++row) {
                 __memcpy(left_nram + row * K_TILE,
@@ -54,7 +54,7 @@ __mlu_entry__ void bmm_kernel(
                          GDRAM2NRAM);
             }
 
-            // 2. 搬运右矩阵 B 片段：严格只拷贝真实有效行列，使用合法唯一的 GDRAM2WRAM 方向宏
+            // 2. 搬运右矩阵 B 片段到 WRAM
             for (int kk = 0; kk < k_size; ++kk) {
                 __memcpy(right_wram + kk * N_TILE,
                          B + (b * k + k_start + kk) * n + col_start,
@@ -62,28 +62,33 @@ __mlu_entry__ void bmm_kernel(
                          GDRAM2WRAM);
             }
 
-            // 3. 硬件 FP32 6 参数调用：核心传入真实边界尺寸 (m_size, k_size, n_size)
-            // 此时左矩阵排布跨步虽然为 K_TILE，但在 k_size 之后的数据已经是纯 0。
-            // 传入真实尺寸能物理拦截 WRAM 无效区域的脏数据，同时避免对齐卡死
+            // 3. 硬件满尺寸高速矩阵乘法调用，确保排布 Stride 恒定为 N_TILE
             __bang_matmul(partial_nram,
                           left_nram,
                           right_wram,
-                          m_size,
-                          k_size,
-                          n_size);
+                          M_TILE,
+                          K_TILE,
+                          N_TILE);
 
-            // 4. 计算完的有效数据在 partial_nram 中是紧凑排布的（行跨步为 n_size）。
-            // 为了能安全地与满尺寸的 accum_nram 执行矩阵 __bang_add，我们在片上将其累加到 accum_nram
-            // 直接采用传统的循环或利用向量偏置处理。由于维度较小，直接在片上规约累加：
-            for (int row = 0; row < m_size; ++row) {
-                __bang_add(accum_nram + row * N_TILE,
-                           accum_nram + row * N_TILE,
-                           partial_nram + row * n_size,
-                           n_size);
+            // 4. 【终极精准清洗】按照恒定的 N_TILE 跨步抹除有效范围外的所有脏计算数据
+            for (int row = 0; row < M_TILE; ++row) {
+                if (row >= m_size) {
+                    // 超出 M 轴边界的整行清零
+                    __bang_write_value(partial_nram + row * N_TILE, N_TILE, 0.0f);
+                } else if (n_size < N_TILE) {
+                    // 有效行内部，超出 N 轴边界的尾部无效列片段清零
+                    __bang_write_value(partial_nram + row * N_TILE + n_size, N_TILE - n_size, 0.0f);
+                }
             }
+
+            // 5. 此时 partial_nram 绝对纯净无杂质，执行一条向量化指令满片累加
+            __bang_add(accum_nram,
+                       accum_nram,
+                       partial_nram,
+                       M_TILE * N_TILE);
         }
 
-        // 5. 将计算出的真实有效部分拷回 GDRAM 目的地
+        // 6. 将计算好的结果区域写回全局 GDRAM
         for (int row = 0; row < m_size; ++row) {
             __memcpy(C + (b * m + row_start + row) * n + col_start,
                      accum_nram + row * N_TILE,
@@ -115,7 +120,7 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {TASK_NUM, 1, 1};
 
-    // 采用通用稳定的多核高吞吐 cnrtFuncTypeUnion1 模式启动
+    // 采用多核高吞吐的集群联盟 Union1 启动，释放硬件极致算力
     bmm_kernel<<<dim, cnrtFuncTypeUnion1, queue>>>(
         A_fp32.data_ptr<float>(),
         B_fp32.data_ptr<float>(),
