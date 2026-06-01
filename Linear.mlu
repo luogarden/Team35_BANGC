@@ -1,0 +1,112 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+#define TASK_NUM 16
+
+__mlu_entry__ void linear_kernel(
+    float *x,
+    float *weight,
+    float *bias,
+    float *output,
+    int M,
+    int K,
+    int N,
+    bool use_bias) {
+
+    int total = M * N;
+    __nram__ float nram_x[CHUNK_SIZE];
+    __nram__ float nram_w[CHUNK_SIZE];
+    __nram__ float nram_prod[CHUNK_SIZE];
+
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        int col = idx % N;
+        int row = idx / N;
+
+        float sum = 0.0f;
+        for (int start = 0; start < K; start += CHUNK_SIZE) {
+            int len = (start + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - start);
+            int aligned_len = (len + 63) & ~63;
+
+            __memcpy(nram_x, x + row * K + start,
+                     len * sizeof(float), GDRAM2NRAM);
+            __memcpy(nram_w, weight + col * K + start,
+                     len * sizeof(float), GDRAM2NRAM);
+
+            for (int i = len; i < aligned_len; ++i) {
+                nram_x[i] = 0.0f;
+                nram_w[i] = 0.0f;
+            }
+
+            __bang_mul(nram_prod, nram_x, nram_w, aligned_len);
+            sum += __bang_sum(nram_prod, aligned_len);
+        }
+
+        if (use_bias) {
+            sum += bias[col];
+        }
+
+        nram_prod[0] = sum;
+        __memcpy(output + idx, nram_prod, sizeof(float), NRAM2GDRAM);
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int in_features,
+    int out_features,
+    bool use_bias) {
+
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    torch::Tensor weight_fp32 = weight;
+    torch::Tensor bias_fp32 = bias;
+
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+        weight_fp32 = weight.to(torch::kFloat);
+        if (use_bias && bias.numel() > 0) {
+            bias_fp32 = bias.to(torch::kFloat);
+        }
+    }
+
+    int batch = (int)x_fp32.size(0);
+    int seq = (int)x_fp32.size(1);
+    int K = (int)in_features;
+    int N = (int)out_features;
+    int M = batch * seq;
+
+    auto output_fp32 = torch::empty(
+        {(int64_t)batch, (int64_t)seq, (int64_t)N},
+        x_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {TASK_NUM, 1, 1};
+    cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_BLOCK;
+
+    float *bias_ptr = (use_bias && bias_fp32.numel() > 0)
+                      ? bias_fp32.data_ptr<float>()
+                      : nullptr;
+
+    linear_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        weight_fp32.data_ptr<float>(),
+        bias_ptr,
+        output_fp32.data_ptr<float>(),
+        M, K, N, use_bias
+    );
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
