@@ -6,6 +6,7 @@
 #define K_TILE 256
 #define N_TILE 128
 #define TASK_NUM 32
+#define FIX_POSITION 0
 
 __mlu_entry__ void bmm_kernel(
     half *A,
@@ -66,7 +67,8 @@ __mlu_entry__ void bmm_kernel(
                           right_wram,
                           M_TILE,
                           K_TILE,
-                          N_TILE);
+                          N_TILE,
+                          FIX_POSITION);
 
             __bang_add(accum_nram,
                        accum_nram,
