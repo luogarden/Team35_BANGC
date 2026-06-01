@@ -1,0 +1,113 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_entry__ void transform_vals_kernel(
+    float *a,
+    float *b,
+    float *output,
+    int total) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+
+    uint32_t per_core = total / core_num;
+    uint32_t remainder = total % core_num;
+
+    uint32_t start =
+        core_id * per_core +
+        (core_id < remainder ? core_id : remainder);
+
+    uint32_t count =
+        per_core +
+        (core_id < remainder ? 1 : 0);
+
+    __nram__ float nram_a[CHUNK_SIZE];
+    __nram__ float nram_b[CHUNK_SIZE];
+    __nram__ float nram_out[CHUNK_SIZE];
+
+    for (uint32_t offset = 0;
+         offset < count;
+         offset += CHUNK_SIZE) {
+
+        uint32_t len =
+            (offset + CHUNK_SIZE <= count)
+                ? CHUNK_SIZE
+                : (count - offset);
+
+        uint32_t aligned_len =
+            (len + 63) & ~63;
+
+        __memcpy(
+            nram_a,
+            a + start + offset,
+            len * sizeof(float),
+            GDRAM2NRAM);
+
+        __memcpy(
+            nram_b,
+            b + start + offset,
+            len * sizeof(float),
+            GDRAM2NRAM);
+
+        __bang_add(
+            nram_out,
+            nram_a,
+            nram_b,
+            aligned_len);
+
+        __memcpy(
+            output + start + offset,
+            nram_out,
+            len * sizeof(float),
+            NRAM2GDRAM);
+    }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor a,
+    torch::Tensor b) {
+
+    TORCH_CHECK(a.is_contiguous(), "Input a must be contiguous");
+    TORCH_CHECK(b.is_contiguous(), "Input b must be contiguous");
+    TORCH_CHECK(a.numel() == b.numel(), "Input tensors must have the same size");
+
+    auto original_dtype = a.scalar_type();
+
+    torch::Tensor a_fp32 = a;
+    torch::Tensor b_fp32 = b;
+
+    if (original_dtype != torch::kFloat) {
+        a_fp32 = a.to(torch::kFloat);
+    }
+    if (b.scalar_type() != torch::kFloat) {
+        b_fp32 = b.to(torch::kFloat);
+    }
+
+    auto output_fp32 = torch::empty_like(a_fp32);
+    int total = a_fp32.numel();
+
+    cnrtQueue_t queue =
+        torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim = {16, 1, 1};
+    cnrtFunctionType_t ktype =
+        cnrtFuncTypeUnion1;
+
+    transform_vals_kernel<<<
+        dim,
+        ktype,
+        queue>>>(
+            a_fp32.data_ptr<float>(),
+            b_fp32.data_ptr<float>(),
+            output_fp32.data_ptr<float>(),
+            total);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
