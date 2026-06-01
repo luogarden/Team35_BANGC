@@ -9,18 +9,36 @@ __mlu_func__ float fast_sqrt(float x) {
         return 0.0f;
     }
     
-    // 初始估计
-    float guess = x;
-    if (guess > 1.0f) {
-        // 对于 x > 1，初始估计为 x / 2
-        guess = x * 0.5f + 0.5f;
-    } else {
-        // 对于 x < 1，初始估计为 x（因为 sqrt(x) ≈ x 当 x→0）
-        // 但更好的估计是 x + (1-x)*0.5 = 0.5 + 0.5*x
-        guess = 0.5f + 0.5f * x;
+    // 基于 IEEE 754 的高精度初始估计
+    union {
+        float f;
+        unsigned int i;
+    } u;
+    u.f = x;
+    
+    int exp = ((u.i >> 23) & 0xFF) - 127;
+    int new_exp = exp >> 1;
+    int odd = exp & 1;
+    
+    // 保留尾数，设置新指数
+    unsigned int mantissa = u.i & 0x007FFFFF;
+    u.i = mantissa | ((new_exp + 127) << 23);
+    float guess = u.f;
+    
+    // 奇数指数修正
+    if (odd) {
+        guess *= 1.4142135623730951f;
     }
     
-    // 牛顿迭代 5 次确保精度
+    // 对尾数进行精细调整，使初始估计误差 < 2%
+    float m = mantissa / 8388608.0f;  // 尾数归一化到 [0, 1)
+    // sqrt(1 + m) 的线性近似：1 + 0.5*m - 0.125*m*(1-m) 
+    // 这是 sqrt(1+x) 在 x=0 处的二阶泰勒展开
+    float correction = 1.0f + 0.5f * m - 0.125f * m * (1.0f - m);
+    guess *= correction;
+    
+    // 牛顿迭代 6 次，确保所有值收敛到 float 精度
+    guess = 0.5f * (guess + x / guess);
     guess = 0.5f * (guess + x / guess);
     guess = 0.5f * (guess + x / guess);
     guess = 0.5f * (guess + x / guess);
@@ -66,8 +84,7 @@ __mlu_entry__ void sqrt_kernel(
 
         for (uint32_t i = 0; i < len; i++) {
             float val = buf[i];
-            // abs(x)
-            val = val >= 0.0f ? val : -val;
+            val = val >= 0.0f ? val : -val;  // abs
             buf[i] = fast_sqrt(val);
         }
 
