@@ -23,20 +23,19 @@ __mlu_func__ float fast_log(float x) {
     }
     float y = (mantissa - 1.0f) / (mantissa + 1.0f);
     float y2 = y * y;
-    float term = y;
-    float poly = term;
-    term *= y2;
-    poly += term * 0.3333333333333333f;
-    term *= y2;
-    poly += term * 0.2f;
-    term *= y2;
-    poly += term * 0.14285714285714285f;
-    term *= y2;
-    poly += term * 0.1111111111111111f;
-    term *= y2;
-    poly += term * 0.09090909090909091f;
-    term *= y2;
-    poly += term * 0.07692307692307693f;
+    float y3 = y2 * y;
+    float y5 = y3 * y2;
+    float y7 = y5 * y2;
+    float y9 = y7 * y2;
+    float y11 = y9 * y2;
+    float y13 = y11 * y2;
+    float poly = y
+        + y3 * 0.3333333333333333f
+        + y5 * 0.2f
+        + y7 * 0.14285714285714285f
+        + y9 * 0.1111111111111111f
+        + y11 * 0.09090909090909091f
+        + y13 * 0.07692307692307693f;
     return 2.0f * poly + (float)exponent * 0.6931471805599453f;
 }
 
@@ -52,14 +51,14 @@ __mlu_func__ float fast_exp(float x) {
     int k = (int)(k_f + (k_f >= 0.0f ? 0.5f : -0.5f));
     float r = x - (float)k * 0.6931471805599453f;
     float r2 = r * r;
-    float p = 1.0f + r * (1.0f + r2 * (0.5f + r * (0.16666666666666666f +
-              r * (0.041666666666666664f + r * 0.008333333333333333f))));
-    unsigned int bits = (unsigned int)(k + 127) << 23;
+    float p = 1.0f + r * (1.0f + r * (0.5f + r * (0.16666666666666666f +
+              r * (0.041666666666666664f + r * (0.008333333333333333f +
+              r * (0.001388888888888889f + r * 0.0001984126984126984f))))));
     union {
         float f;
         unsigned int u;
     } result;
-    result.u = bits;
+    result.u = (unsigned int)(k + 127) << 23;
     return p * result.f;
 }
 
