@@ -18,6 +18,7 @@ __mlu_entry__ void bmm_kernel(
 
     int row_tiles = (m + M_TILE - 1) / M_TILE;
     int col_tiles = (n + N_TILE - 1) / N_TILE;
+    int k_tiles = (k + K_TILE - 1) / K_TILE;
     int tiles_per_batch = row_tiles * col_tiles;
     int total_tiles = batch * tiles_per_batch;
 
@@ -31,24 +32,30 @@ __mlu_entry__ void bmm_kernel(
         int tile_in_batch = tile - b * tiles_per_batch;
         int row_tile = tile_in_batch / col_tiles;
         int col_tile = tile_in_batch - row_tile * col_tiles;
-
         int row_start = row_tile * M_TILE;
         int col_start = col_tile * N_TILE;
         int m_size = (row_start + M_TILE <= m) ? M_TILE : (m - row_start);
         int n_size = (col_start + N_TILE <= n) ? N_TILE : (n - col_start);
 
-        for (int k_start = 0; k_start < k; k_start += K_TILE) {
+        __bang_write_value(accum_nram, M_TILE * N_TILE, (half)0.0f);
+
+        for (int kt = 0; kt < k_tiles; ++kt) {
+            int k_start = kt * K_TILE;
             int k_size = (k_start + K_TILE <= k) ? K_TILE : (k - k_start);
 
+            __bang_write_value(left_nram, M_TILE * K_TILE, (half)0.0f);
             for (int row = 0; row < m_size; ++row) {
-                __memcpy(left_nram + row * k_size,
+                __memcpy(left_nram + row * K_TILE,
                          A + (b * m + row_start + row) * k + k_start,
                          k_size * sizeof(half),
                          GDRAM2NRAM);
             }
 
+            for (int i = 0; i < K_TILE * N_TILE; ++i) {
+                right_wram[i] = (half)0.0f;
+            }
             for (int kk = 0; kk < k_size; ++kk) {
-                __memcpy(right_wram + kk * n_size,
+                __memcpy(right_wram + kk * N_TILE,
                          B + (b * k + k_start + kk) * n + col_start,
                          n_size * sizeof(half),
                          GDRAM2WRAM);
@@ -57,26 +64,19 @@ __mlu_entry__ void bmm_kernel(
             __bang_matmul(partial_nram,
                           left_nram,
                           right_wram,
-                          m_size,
-                          k_size,
-                          n_size);
+                          M_TILE,
+                          K_TILE,
+                          N_TILE);
 
-            if (k_start == 0) {
-                __memcpy(accum_nram,
-                         partial_nram,
-                         m_size * n_size * sizeof(half),
-                         NRAM2NRAM);
-            } else {
-                __bang_add(accum_nram,
-                           accum_nram,
-                           partial_nram,
-                           m_size * n_size);
-            }
+            __bang_add(accum_nram,
+                       accum_nram,
+                       partial_nram,
+                       M_TILE * N_TILE);
         }
 
         for (int row = 0; row < m_size; ++row) {
             __memcpy(C + (b * m + row_start + row) * n + col_start,
-                     accum_nram + row * n_size,
+                     accum_nram + row * N_TILE,
                      n_size * sizeof(half),
                      NRAM2GDRAM);
         }
