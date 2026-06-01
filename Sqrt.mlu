@@ -1,4 +1,6 @@
 #include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
 
 #define CHUNK_SIZE 4096
 
@@ -33,10 +35,9 @@ __mlu_entry__ void sqrt_kernel(
             len * sizeof(half),
             GDRAM2NRAM);
 
-        // 先取绝对值: abs(x)
+        // abs(x)
         __bang_active_abs(nram, nram, len);
-
-        // 再求平方根: sqrt(abs(x))
+        // sqrt(abs(x))
         __bang_active_sqrt(nram, nram, len);
 
         __memcpy(
@@ -45,4 +46,35 @@ __mlu_entry__ void sqrt_kernel(
             len * sizeof(half),
             NRAM2GDRAM);
     }
+}
+
+torch::Tensor bang_func(torch::Tensor x) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+
+    auto original_dtype = x.scalar_type();
+    torch::Tensor input_fp16 = x;
+
+    // 确保输入是 half 类型
+    if (original_dtype != torch::kHalf) {
+        input_fp16 = x.to(torch::kHalf);
+    }
+
+    auto output_fp16 = torch::empty_like(input_fp16);
+    int total = input_fp16.numel();
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    sqrt_kernel<<<dim, ktype, queue>>>(
+        input_fp16.data_ptr<<at::Half>(),
+        output_fp16.data_ptr<<at::Half>(),
+        total
+    );
+
+    // 如果原始类型不是 half，转回去
+    if (original_dtype != torch::kHalf) {
+        return output_fp16.to(original_dtype);
+    }
+    return output_fp16;
 }
