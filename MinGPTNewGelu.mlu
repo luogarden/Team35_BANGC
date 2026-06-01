@@ -1,0 +1,131 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_func__ float fast_exp(float x) {
+    if (x < -87.3f) {
+        return 0.0f;
+    }
+    if (x > 87.3f) {
+        x = 87.3f;
+    }
+
+    const float inv_ln2 = 1.44269504088896341f;
+    const float ln2_hi = 0.693359375f;
+    const float ln2_lo = -0.00021217204052209854f;
+
+    float kf = x * inv_ln2;
+    int k = (int)(kf + (kf >= 0.0f ? 0.5f : -0.5f));
+    float r = x - (float)k * ln2_hi - (float)k * ln2_lo;
+
+    float p = 1.0f + r * (1.0f + r * (0.5f +
+              r * (0.16666667163372039795f +
+              r * (0.04166668280959129333f +
+              r * (0.00833333097338676453f +
+              r * (0.00138889296869188547f +
+              r * (0.00019841069537773788f +
+              r * 0.000024793375991914592f)))))));
+
+    union {
+        float f;
+        unsigned int u;
+    } result;
+    result.u = (unsigned int)(k + 127) << 23;
+    return p * result.f;
+}
+
+__mlu_entry__ void mingptnewgelu_kernel(
+    float *input,
+    float *output,
+    int total) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total / core_num;
+    uint32_t remainder = total % core_num;
+
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
+
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
+
+    __nram__ float nram_input[CHUNK_SIZE];
+
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
+
+        uint32_t len =
+            (offset + CHUNK_SIZE <= count)
+                ? CHUNK_SIZE
+                : (count - offset);
+
+        __memcpy(
+            nram_input,
+            input + start + offset,
+            len * sizeof(float),
+            GDRAM2NRAM);
+
+        for (uint32_t i = 0; i < len; i++) {
+            float x = nram_input[i];
+            float x3 = x * x * x;
+            float inner = 0.7978845608028654f * (x + 0.044715f * x3);
+            float tanh_val;
+            if (inner > 9.0f) {
+                tanh_val = 1.0f;
+            } else if (inner < -9.0f) {
+                tanh_val = -1.0f;
+            } else {
+                float e2x = fast_exp(2.0f * inner);
+                tanh_val = (e2x - 1.0f) / (e2x + 1.0f);
+            }
+            nram_input[i] = 0.5f * x * (1.0f + tanh_val);
+        }
+
+        __memcpy(
+            output + start + offset,
+            nram_input,
+            len * sizeof(float),
+            NRAM2GDRAM);
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x) {
+
+    TORCH_CHECK(
+        x.is_contiguous(),
+        "Input must be contiguous");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor input_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        input_fp32 = x.to(torch::kFloat);
+    }
+
+    auto output_fp32 = torch::empty_like(input_fp32);
+
+    int total = input_fp32.numel();
+
+    cnrtQueue_t queue =
+        torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim = {4,1,1};
+    cnrtFunctionType_t ktype =
+        cnrtFuncTypeUnion1;
+
+    mingptnewgelu_kernel<<<dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        total
+    );
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
