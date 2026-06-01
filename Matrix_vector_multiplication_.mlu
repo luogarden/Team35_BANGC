@@ -3,20 +3,35 @@
 #include <cnrt.h>
 
 #define TASK_NUM 16
+#define K_TILE 4096
 
 __mlu_entry__ void gemv_kernel(float *A, float *B, float *C, int m, int k) {
-    __nram__ float tmp[2];
+    __nram__ float nram_a[K_TILE];
+    __nram__ float nram_b[K_TILE];
+    __nram__ float nram_prod[K_TILE];
 
     for (int row = taskId; row < m; row += taskDim) {
         float sum = 0.0f;
-        for (int kk = 0; kk < k; ++kk) {
-            __memcpy(tmp, A + row * k + kk, sizeof(float), GDRAM2NRAM);
-            __memcpy(tmp + 1, B + kk, sizeof(float), GDRAM2NRAM);
-            sum += tmp[0] * tmp[1];
+        for (int start = 0; start < k; start += K_TILE) {
+            int len = (start + K_TILE <= k) ? K_TILE : (k - start);
+            int aligned_len = (len + 63) & ~63;
+
+            __memcpy(nram_a, A + row * k + start,
+                     len * sizeof(float), GDRAM2NRAM);
+            __memcpy(nram_b, B + start,
+                     len * sizeof(float), GDRAM2NRAM);
+
+            for (int i = len; i < aligned_len; ++i) {
+                nram_a[i] = 0.0f;
+                nram_b[i] = 0.0f;
+            }
+
+            __bang_mul(nram_prod, nram_a, nram_b, aligned_len);
+            sum += __bang_sum(nram_prod, aligned_len);
         }
 
-        tmp[0] = sum;
-        __memcpy(C + row, tmp, sizeof(float), NRAM2GDRAM);
+        nram_prod[0] = sum;
+        __memcpy(C + row, nram_prod, sizeof(float), NRAM2GDRAM);
     }
 }
 
