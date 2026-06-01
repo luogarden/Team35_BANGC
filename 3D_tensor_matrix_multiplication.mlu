@@ -1,0 +1,143 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <vector>
+
+#define M_TILE 32
+#define K_TILE 512
+#define L_TILE 128
+#define TASK_NUM 16
+
+__mlu_entry__ void tensor3d_matmul_kernel(
+    float *A,
+    float *B,
+    float *C,
+    int rows,
+    int K,
+    int L) {
+
+    int row_tiles = rows / M_TILE;
+    int col_tiles = L / L_TILE;
+    int total_tiles = row_tiles * col_tiles;
+
+    __nram__ float left_nram[M_TILE * K_TILE];
+    __wram__ float right_wram[K_TILE * L_TILE];
+    __nram__ float partial_nram[M_TILE * L_TILE];
+    __nram__ float accum_nram[M_TILE * L_TILE];
+
+    for (int tile = taskId; tile < total_tiles; tile += taskDim) {
+        int row_tile = tile / col_tiles;
+        int col_tile = tile - row_tile * col_tiles;
+        int row_start = row_tile * M_TILE;
+        int col_start = col_tile * L_TILE;
+
+        for (int k_start = 0; k_start < K; k_start += K_TILE) {
+            __memcpy(
+                left_nram,
+                A + row_start * K + k_start,
+                K_TILE * sizeof(float),
+                GDRAM2NRAM,
+                K_TILE * sizeof(float),
+                K * sizeof(float),
+                M_TILE);
+
+            __memcpy(
+                right_wram,
+                B + k_start * L + col_start,
+                L_TILE * sizeof(float),
+                GDRAM2WRAM,
+                L_TILE * sizeof(float),
+                L * sizeof(float),
+                K_TILE);
+
+            __bang_matmul(
+                partial_nram,
+                left_nram,
+                right_wram,
+                M_TILE,
+                K_TILE,
+                L_TILE);
+
+            if (k_start == 0) {
+                __memcpy(
+                    accum_nram,
+                    partial_nram,
+                    M_TILE * L_TILE * sizeof(float),
+                    NRAM2NRAM);
+            } else {
+                __bang_add(
+                    accum_nram,
+                    accum_nram,
+                    partial_nram,
+                    M_TILE * L_TILE);
+            }
+        }
+
+        __memcpy(
+            C + row_start * L + col_start,
+            accum_nram,
+            L_TILE * sizeof(float),
+            NRAM2GDRAM,
+            L * sizeof(float),
+            L_TILE * sizeof(float),
+            M_TILE);
+    }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor A,
+    torch::Tensor B) {
+
+    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
+    TORCH_CHECK(A.dim() == 3, "A must be a 3D tensor");
+    TORCH_CHECK(B.dim() == 2, "B must be a 2D tensor");
+    TORCH_CHECK(A.size(2) == B.size(0), "A.size(2) must equal B.size(0)");
+
+    int N = (int)A.size(0);
+    int M = (int)A.size(1);
+    int K = (int)A.size(2);
+    int L = (int)B.size(1);
+    int rows = N * M;
+
+    TORCH_CHECK(rows % M_TILE == 0,
+                "N * M must be divisible by the row tile size");
+    TORCH_CHECK(K % K_TILE == 0,
+                "K must be divisible by the reduction tile size");
+    TORCH_CHECK(L % L_TILE == 0,
+                "L must be divisible by the column tile size");
+
+    auto original_dtype = A.scalar_type();
+
+    torch::Tensor A_fp32 = A;
+    torch::Tensor B_fp32 = B;
+    if (A_fp32.scalar_type() != torch::kFloat) {
+        A_fp32 = A_fp32.to(torch::kFloat);
+    }
+    if (B_fp32.scalar_type() != torch::kFloat) {
+        B_fp32 = B_fp32.to(torch::kFloat);
+    }
+
+    auto C_fp32 =
+        torch::empty({(int64_t)N, (int64_t)M, (int64_t)L},
+                     A_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {TASK_NUM, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    tensor3d_matmul_kernel<<<dim, ktype, queue>>>(
+        A_fp32.data_ptr<float>(),
+        B_fp32.data_ptr<float>(),
+        C_fp32.data_ptr<float>(),
+        rows,
+        K,
+        L);
+
+    if (original_dtype != torch::kFloat) {
+        return C_fp32.to(original_dtype);
+    }
+
+    return C_fp32;
+}
