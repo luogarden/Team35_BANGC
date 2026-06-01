@@ -11,6 +11,7 @@ __mlu_entry__ void bmm_kernel(
     float *A,
     float *B,
     float *C,
+    float *zero,
     int batch,
     int m,
     int k,
@@ -51,6 +52,10 @@ __mlu_entry__ void bmm_kernel(
                          GDRAM2NRAM);
             }
 
+            __memcpy(right_wram,
+                     zero,
+                     K_TILE * N_TILE * sizeof(float),
+                     GDRAM2WRAM);
             for (int kk = 0; kk < k_size; ++kk) {
                 __memcpy(right_wram + kk * N_TILE,
                          B + (b * k + k_start + kk) * n + col_start,
@@ -61,9 +66,21 @@ __mlu_entry__ void bmm_kernel(
             __bang_matmul(partial_nram,
                           left_nram,
                           right_wram,
-                          m_size,
+                          M_TILE,
                           K_TILE,
-                          n_size);
+                          N_TILE);
+
+            for (int row = 0; row < M_TILE; ++row) {
+                if (row >= m_size) {
+                    __bang_write_value(partial_nram + row * N_TILE,
+                                       N_TILE,
+                                       0.0f);
+                } else if (n_size < N_TILE) {
+                    __bang_write_value(partial_nram + row * N_TILE + n_size,
+                                       N_TILE - n_size,
+                                       0.0f);
+                }
+            }
 
             __bang_add(accum_nram,
                        accum_nram,
@@ -104,6 +121,7 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
 
     auto C_fp32 = torch::empty({(int64_t)batch, (int64_t)m, (int64_t)n},
                                A_fp32.options());
+    auto zero = torch::zeros({(int64_t)(K_TILE * N_TILE)}, A_fp32.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {TASK_NUM, 1, 1};
@@ -111,10 +129,12 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
         A_fp32.data_ptr<float>(),
         B_fp32.data_ptr<float>(),
         C_fp32.data_ptr<float>(),
+        zero.data_ptr<float>(),
         batch,
         m,
         k,
         n);
 
+    cnrtQueueSync(queue);
     return C_fp32;
 }
