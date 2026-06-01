@@ -1,0 +1,100 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+
+#define MAX_GATHER_K 1024
+
+__mlu_entry__ void gather_rows_kernel(
+    float *input,
+    int64_t *index,
+    float *output,
+    int batch,
+    int input_cols,
+    int gather_cols) {
+
+    __nram__ int64_t nram_index[MAX_GATHER_K];
+    __nram__ float nram_output[MAX_GATHER_K];
+
+    for (int row = taskId; row < batch; row += taskDim) {
+        __memcpy(
+            nram_index,
+            index + row * gather_cols,
+            gather_cols * sizeof(int64_t),
+            GDRAM2NRAM);
+
+        for (int col = 0; col < gather_cols; ++col) {
+            int src_col = (int)nram_index[col];
+            __memcpy(
+                nram_output + col,
+                input + row * input_cols + src_col,
+                sizeof(float),
+                GDRAM2NRAM);
+        }
+
+        __memcpy(
+            output + row * gather_cols,
+            nram_output,
+            gather_cols * sizeof(float),
+            NRAM2GDRAM);
+    }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor input,
+    torch::Tensor index) {
+
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(index.is_contiguous(), "index must be contiguous");
+    TORCH_CHECK(input.dim() == 2, "input must be a 2D tensor");
+    TORCH_CHECK(index.dim() == 2, "index must be a 2D tensor");
+    TORCH_CHECK(input.size(0) == index.size(0),
+                "input and index must have the same batch size");
+
+    int batch = (int)input.size(0);
+    int input_cols = (int)input.size(1);
+    int gather_cols = (int)index.size(1);
+    TORCH_CHECK(gather_cols <= MAX_GATHER_K,
+                "index width is larger than the supported workspace");
+
+    auto original_dtype = input.scalar_type();
+    bool uses_temporary = false;
+
+    torch::Tensor input_fp32 = input;
+    if (original_dtype != torch::kFloat) {
+        input_fp32 = input.to(torch::kFloat);
+        uses_temporary = true;
+    }
+
+    torch::Tensor index_i64 = index;
+    if (index_i64.scalar_type() != torch::kLong) {
+        index_i64 = index.to(torch::kLong);
+        uses_temporary = true;
+    }
+
+    auto output_fp32 =
+        torch::empty({(int64_t)batch, (int64_t)gather_cols},
+                     input_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {16, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    gather_rows_kernel<<<dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        index_i64.data_ptr<int64_t>(),
+        output_fp32.data_ptr<float>(),
+        batch,
+        input_cols,
+        gather_cols);
+
+    if (uses_temporary) {
+        cnrtQueueSync(queue);
+    }
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
