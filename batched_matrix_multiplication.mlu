@@ -3,7 +3,7 @@
 #include <cnrt.h>
 
 #define M_TILE 16
-#define K_TILE 256
+#define K_TILE 128
 #define N_TILE 128
 #define TASK_NUM 32
 
@@ -26,9 +26,6 @@ __mlu_entry__ void bmm_kernel(
     __wram__ float right_wram[K_TILE * N_TILE];
     __nram__ float partial_nram[M_TILE * N_TILE];
     __nram__ float accum_nram[M_TILE * N_TILE];
-    __nram__ float zero_nram[N_TILE];
-
-    __bang_write_value(zero_nram, N_TILE, 0.0f);
 
     for (int tile = taskId; tile < total_tiles; tile += taskDim) {
         int b = tile / tiles_per_batch;
@@ -54,32 +51,19 @@ __mlu_entry__ void bmm_kernel(
                          GDRAM2NRAM);
             }
 
-            for (int kk = 0; kk < K_TILE; ++kk) {
-                if (kk < k_size) {
-                    __memcpy(right_wram + kk * N_TILE,
-                             B + (b * k + k_start + kk) * n + col_start,
-                             n_size * sizeof(float),
-                             GDRAM2WRAM);
-                    if (n_size < N_TILE) {
-                        __memcpy(right_wram + kk * N_TILE + n_size,
-                                 zero_nram,
-                                 (N_TILE - n_size) * sizeof(float),
-                                 NRAM2WRAM);
-                    }
-                } else {
-                    __memcpy(right_wram + kk * N_TILE,
-                             zero_nram,
-                             N_TILE * sizeof(float),
-                             NRAM2WRAM);
-                }
+            for (int kk = 0; kk < k_size; ++kk) {
+                __memcpy(right_wram + kk * N_TILE,
+                         B + (b * k + k_start + kk) * n + col_start,
+                         n_size * sizeof(float),
+                         GDRAM2WRAM);
             }
 
             __bang_matmul(partial_nram,
                           left_nram,
                           right_wram,
-                          M_TILE,
+                          m_size,
                           K_TILE,
-                          N_TILE);
+                          n_size);
 
             __bang_add(accum_nram,
                        accum_nram,
