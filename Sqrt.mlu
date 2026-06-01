@@ -25,25 +25,27 @@ __mlu_entry__ void sqrt_kernel(
 
     __nram__ float buf[CHUNK_SIZE];
 
-    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
+    for (uint32_t offset = 0;
+         offset < count;
+         offset += CHUNK_SIZE) {
 
         uint32_t len =
             (offset + CHUNK_SIZE <= count)
                 ? CHUNK_SIZE
                 : (count - offset);
 
-        uint32_t aligned_len = (len + 63) & ~63;
-
+        // ⚠️ 不要 over-aligned compute
         __memcpy(
             buf,
             input + start + offset,
             len * sizeof(float),
             GDRAM2NRAM);
 
+        // ✔ 关键：torch.sqrt = 不做 abs
         __bang_active_sqrt(
             buf,
             buf,
-            aligned_len);
+            len);
 
         __memcpy(
             output + start + offset,
@@ -53,19 +55,13 @@ __mlu_entry__ void sqrt_kernel(
     }
 }
 
-// ⭐ 关键：不要 torch::Tensor
-at::Tensor bang_func(at::Tensor input) {
+torch::Tensor bang_func(torch::Tensor input) {
 
-    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
 
-    auto x = input;
-    auto dtype = input.scalar_type();
+    auto x = input.to(torch::kFloat);
+    auto out = torch::empty_like(x);
 
-    if (dtype != at::kFloat) {
-        x = input.to(at::kFloat);
-    }
-
-    auto out = at::empty_like(x);
     int total = x.numel();
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
@@ -78,8 +74,8 @@ at::Tensor bang_func(at::Tensor input) {
         out.data_ptr<float>(),
         total);
 
-    if (dtype != at::kFloat) {
-        return out.to(dtype);
+    if (input.scalar_type() != torch::kFloat) {
+        return out.to(input.scalar_type());
     }
 
     return out;
