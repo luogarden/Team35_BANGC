@@ -1,70 +1,23 @@
 #include <bang.h>
-#include <cnrt.h>
-#include <float.h>
 
-#define CHUNK_SIZE 16384  // 每次 NRAM 处理元素数量，可根据设备调节
+#define CHUNK 16384
 
-// =============================================================================
-// Kernel: 逐元素平方根
-// 输入：src [N]
-// 输出：dst [N]
-// =============================================================================
-__mlu_entry__ void SqrtKernel(float* dst, const float* src, int total) {
-    // 每个 task 处理部分元素
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
+__mlu_entry__ void sqrt_kernel(float* dst, const float* src, int total) {
+    uint32_t tid = taskId;
+    uint32_t tnum = taskDim;
 
-    uint32_t per_core = total / core_num;
-    uint32_t remainder = total % core_num;
+    uint32_t per = total / tnum;
+    uint32_t rem = total % tnum;
 
-    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
-    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
+    uint32_t start = tid * per + (tid < rem ? tid : rem);
+    uint32_t count = per + (tid < rem ? 1 : 0);
 
-    __nram__ float nram_tile[CHUNK_SIZE];
+    __nram__ float buf[CHUNK];
 
-    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
-        uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
-
-        // 从 GDRAM 拷贝到 NRAM
-        __memcpy(nram_tile, src + start + offset, len * sizeof(float), GDRAM2NRAM);
-
-        // 使用 Bang 指令执行逐元素开方
-        __bang_active_sqrt(nram_tile, nram_tile, len);
-
-        // 拷贝回 GDRAM
-        __memcpy(dst + start + offset, nram_tile, len * sizeof(float), NRAM2GDRAM);
+    for (uint32_t offset = 0; offset < count; offset += CHUNK) {
+        uint32_t len = (offset + CHUNK <= count) ? CHUNK : (count - offset);
+        __memcpy(buf, src + start + offset, len * sizeof(float), GDRAM2NRAM);
+        __bang_active_sqrt(buf, buf, len);
+        __memcpy(dst + start + offset, buf, len * sizeof(float), NRAM2GDRAM);
     }
-}
-
-// =============================================================================
-// Host 接口
-// =============================================================================
-torch::Tensor bang_sqrt(torch::Tensor input) {
-    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
-
-    auto original_dtype = input.scalar_type();
-    torch::Tensor input_fp32 = input;
-    if (original_dtype != torch::kFloat) {
-        input_fp32 = input.to(torch::kFloat);
-    }
-
-    auto output_fp32 = torch::empty_like(input_fp32);
-    int total = input_fp32.numel();
-
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-
-    SqrtKernel<<<dim, ktype, queue>>>(
-        output_fp32.data_ptr<float>(),
-        input_fp32.data_ptr<float>(),
-        total
-    );
-
-    if (original_dtype != torch::kFloat) {
-        return output_fp32.to(original_dtype);
-    }
-
-    return output_fp32;
 }
