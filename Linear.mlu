@@ -13,7 +13,7 @@ __mlu_entry__ void linear_kernel(
     int M,
     int K,
     int N,
-    bool use_bias) {
+    int use_bias) {
 
     int total = M * N;
     __nram__ float nram_x[CHUNK_SIZE];
@@ -55,27 +55,17 @@ __mlu_entry__ void linear_kernel(
 
 torch::Tensor bang_func(
     torch::Tensor x,
-    torch::Tensor weight,
-    torch::Tensor bias,
     int in_features,
     int out_features,
-    bool use_bias) {
+    bool bias) {
 
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
-    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
 
     auto original_dtype = x.scalar_type();
 
     torch::Tensor x_fp32 = x;
-    torch::Tensor weight_fp32 = weight;
-    torch::Tensor bias_fp32 = bias;
-
     if (original_dtype != torch::kFloat) {
         x_fp32 = x.to(torch::kFloat);
-        weight_fp32 = weight.to(torch::kFloat);
-        if (use_bias && bias.numel() > 0) {
-            bias_fp32 = bias.to(torch::kFloat);
-        }
     }
 
     int batch = (int)x_fp32.size(0);
@@ -83,6 +73,13 @@ torch::Tensor bang_func(
     int K = (int)in_features;
     int N = (int)out_features;
     int M = batch * seq;
+    int use_bias = bias ? 1 : 0;
+
+    auto weight_fp32 = torch::empty(
+        {(int64_t)N, (int64_t)K}, x_fp32.options());
+    auto bias_fp32 = use_bias
+        ? torch::empty({(int64_t)N}, x_fp32.options())
+        : torch::empty({0}, x_fp32.options());
 
     auto output_fp32 = torch::empty(
         {(int64_t)batch, (int64_t)seq, (int64_t)N},
@@ -92,7 +89,7 @@ torch::Tensor bang_func(
     cnrtDim3_t dim = {TASK_NUM, 1, 1};
     cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_BLOCK;
 
-    float *bias_ptr = (use_bias && bias_fp32.numel() > 0)
+    float *bias_ptr = use_bias
                       ? bias_fp32.data_ptr<float>()
                       : nullptr;
 
