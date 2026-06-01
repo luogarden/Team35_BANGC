@@ -1,0 +1,144 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <vector>
+
+#define MAX_REDUCE_SIZE 4096
+#define NEG_INF (-3.4028234663852886e38F)
+
+__mlu_entry__ void topk_kernel(
+    float *input,
+    float *values,
+    int64_t *indices,
+    int batch_size,
+    int inner_dim,
+    int k,
+    int axis) {
+
+    int outer_size = (axis == 1) ? batch_size : inner_dim;
+    int reduce_size = (axis == 1) ? inner_dim : batch_size;
+
+    __nram__ float nram_data[MAX_REDUCE_SIZE];
+    __nram__ float nram_values[MAX_REDUCE_SIZE];
+    __nram__ int64_t nram_indices[MAX_REDUCE_SIZE];
+
+    for (int outer = taskId; outer < outer_size; outer += taskDim) {
+        if (axis == 1) {
+            __memcpy(
+                nram_data,
+                input + outer * inner_dim,
+                reduce_size * sizeof(float),
+                GDRAM2NRAM);
+        } else {
+            for (int i = 0; i < reduce_size; ++i) {
+                __memcpy(
+                    nram_data + i,
+                    input + i * inner_dim + outer,
+                    sizeof(float),
+                    GDRAM2NRAM);
+            }
+        }
+
+        for (int out_idx = 0; out_idx < k; ++out_idx) {
+            float best_value = NEG_INF;
+            int best_index = 0;
+
+            for (int i = 0; i < reduce_size; ++i) {
+                float cur = nram_data[i];
+                if (cur > best_value ||
+                    (cur == best_value && i < best_index)) {
+                    best_value = cur;
+                    best_index = i;
+                }
+            }
+
+            nram_values[out_idx] = best_value;
+            nram_indices[out_idx] = (int64_t)best_index;
+            nram_data[best_index] = NEG_INF;
+        }
+
+        if (axis == 1) {
+            __memcpy(
+                values + outer * k,
+                nram_values,
+                k * sizeof(float),
+                NRAM2GDRAM);
+            __memcpy(
+                indices + outer * k,
+                nram_indices,
+                k * sizeof(int64_t),
+                NRAM2GDRAM);
+        } else {
+            for (int out_idx = 0; out_idx < k; ++out_idx) {
+                __memcpy(
+                    values + out_idx * inner_dim + outer,
+                    nram_values + out_idx,
+                    sizeof(float),
+                    NRAM2GDRAM);
+                __memcpy(
+                    indices + out_idx * inner_dim + outer,
+                    nram_indices + out_idx,
+                    sizeof(int64_t),
+                    NRAM2GDRAM);
+            }
+        }
+    }
+}
+
+std::vector<torch::Tensor> bang_func(
+    torch::Tensor x,
+    int k,
+    int dim) {
+
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(x.dim() == 2, "Input must be a 2D tensor");
+
+    int axis = dim < 0 ? dim + 2 : dim;
+    TORCH_CHECK(axis == 0 || axis == 1, "dim must be 0, 1, -1, or -2");
+
+    int batch_size = (int)x.size(0);
+    int inner_dim = (int)x.size(1);
+    int reduce_size = (axis == 1) ? inner_dim : batch_size;
+
+    TORCH_CHECK(k > 0, "k must be positive");
+    TORCH_CHECK(k <= reduce_size, "k must not exceed the selected dimension");
+    TORCH_CHECK(reduce_size <= MAX_REDUCE_SIZE,
+                "selected dimension is larger than the supported workspace");
+
+    auto original_dtype = x.scalar_type();
+    torch::Tensor input_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        input_fp32 = x.to(torch::kFloat);
+    }
+
+    std::vector<int64_t> output_shape;
+    if (axis == 1) {
+        output_shape = {batch_size, k};
+    } else {
+        output_shape = {k, inner_dim};
+    }
+
+    auto values_fp32 = torch::empty(output_shape, input_fp32.options());
+    auto index_options = x.options().dtype(torch::kLong);
+    auto indices = torch::empty(output_shape, index_options);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch_dim = {16, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    topk_kernel<<<launch_dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        values_fp32.data_ptr<float>(),
+        indices.data_ptr<int64_t>(),
+        batch_size,
+        inner_dim,
+        k,
+        axis);
+
+    if (original_dtype != torch::kFloat) {
+        return {values_fp32.to(original_dtype), indices};
+    }
+
+    return {values_fp32, indices};
+}
