@@ -1,0 +1,125 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_entry__ void avg_pool2d_kernel(
+    float *input,
+    float *output,
+    int batch_size,
+    int channels,
+    int height,
+    int width,
+    int kernel_size,
+    int stride,
+    int output_height,
+    int output_width) {
+
+    int spatial_size = height * width;
+    int output_spatial = output_height * output_width;
+    int total_output = batch_size * channels * output_spatial;
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total_output / core_num;
+    uint32_t remainder = total_output % core_num;
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
+
+    __nram__ float nram_data[CHUNK_SIZE];
+
+    int kernel_area = kernel_size * kernel_size;
+    float inv_area = 1.0f / (float)kernel_area;
+
+    for (uint32_t idx = 0; idx < count; idx++) {
+        uint32_t flat = start + idx;
+        uint32_t w_out = flat % output_width;
+        uint32_t h_c_out = flat / output_width;
+        uint32_t h_out = h_c_out % output_height;
+        uint32_t b_c = h_c_out / output_height;
+        uint32_t c = b_c % channels;
+        uint32_t b = b_c / channels;
+
+        int plane_offset = ((int)b * channels + (int)c) * spatial_size;
+        int in_h = (int)h_out * stride;
+        int in_w = (int)w_out * stride;
+
+        float sum = 0.0f;
+        for (int kh = 0; kh < kernel_size; kh++) {
+            int row_start = plane_offset + (in_h + kh) * width + in_w;
+            __memcpy(nram_data + kh * kernel_size,
+                     input + row_start,
+                     kernel_size * sizeof(float),
+                     GDRAM2NRAM);
+        }
+
+        for (int i = 0; i < kernel_area; i++) {
+            sum += nram_data[i];
+        }
+
+        nram_data[0] = sum * inv_area;
+        int out_idx = ((int)b * channels + (int)c) * output_spatial
+                      + (int)h_out * output_width + (int)w_out;
+        __memcpy(output + out_idx,
+                 nram_data,
+                 sizeof(float),
+                 NRAM2GDRAM);
+    }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor input,
+    int kernel_size) {
+
+    TORCH_CHECK(input.is_contiguous(),
+                "Input must be contiguous");
+    TORCH_CHECK(input.dim() == 4,
+                "Input must be a 4D tensor");
+
+    int stride = kernel_size;
+    int padding = 0;
+
+    int batch_size = (int)input.size(0);
+    int channels = (int)input.size(1);
+    int height = (int)input.size(2);
+    int width = (int)input.size(3);
+
+    int output_height = (height + 2 * padding - kernel_size) / stride + 1;
+    int output_width = (width + 2 * padding - kernel_size) / stride + 1;
+
+    auto original_dtype = input.scalar_type();
+
+    torch::Tensor input_fp32 = input;
+    if (original_dtype != torch::kFloat) {
+        input_fp32 = input.to(torch::kFloat);
+    }
+
+    auto output_fp32 = torch::empty(
+        {batch_size, channels, output_height, output_width},
+        input_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch_dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    avg_pool2d_kernel<<<launch_dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch_size,
+        channels,
+        height,
+        width,
+        kernel_size,
+        stride,
+        output_height,
+        output_width);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
