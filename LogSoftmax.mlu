@@ -1,10 +1,67 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include <cmath>
 
 #define CHUNK_SIZE 4096
 #define NEG_INF (-3.4028234663852886e38F)
+
+__mlu_func__ float fast_log(float x) {
+    if (x <= 0.0f) {
+        return NEG_INF;
+    }
+    union {
+        float f;
+        unsigned int u;
+    } value;
+    value.f = x;
+    int exponent = (int)((value.u >> 23) & 0xff) - 127;
+    value.u = (value.u & 0x007fffff) | 0x3f800000;
+    float mantissa = value.f;
+    if (mantissa > 1.4142135623730951f) {
+        mantissa *= 0.5f;
+        exponent += 1;
+    }
+    float y = (mantissa - 1.0f) / (mantissa + 1.0f);
+    float y2 = y * y;
+    float term = y;
+    float poly = term;
+    term *= y2;
+    poly += term * 0.3333333333333333f;
+    term *= y2;
+    poly += term * 0.2f;
+    term *= y2;
+    poly += term * 0.14285714285714285f;
+    term *= y2;
+    poly += term * 0.1111111111111111f;
+    term *= y2;
+    poly += term * 0.09090909090909091f;
+    term *= y2;
+    poly += term * 0.07692307692307693f;
+    return 2.0f * poly + (float)exponent * 0.6931471805599453f;
+}
+
+__mlu_func__ float fast_exp(float x) {
+    if (x < -87.3f) {
+        return 0.0f;
+    }
+    if (x > 87.3f) {
+        x = 87.3f;
+    }
+    float inv_ln2 = 1.4426950408889634f;
+    float k_f = x * inv_ln2;
+    int k = (int)(k_f + (k_f >= 0.0f ? 0.5f : -0.5f));
+    float r = x - (float)k * 0.6931471805599453f;
+    float r2 = r * r;
+    float p = 1.0f + r * (1.0f + r2 * (0.5f + r * (0.16666666666666666f +
+              r * (0.041666666666666664f + r * 0.008333333333333333f))));
+    unsigned int bits = (unsigned int)(k + 127) << 23;
+    union {
+        float f;
+        unsigned int u;
+    } result;
+    result.u = bits;
+    return p * result.f;
+}
 
 __mlu_entry__ void log_softmax_kernel(
     float *input,
@@ -36,23 +93,12 @@ __mlu_entry__ void log_softmax_kernel(
             for (uint32_t offset = 0; offset < (uint32_t)dim_size; offset += CHUNK_SIZE) {
                 uint32_t len = (offset + CHUNK_SIZE <= (uint32_t)dim_size)
                                ? CHUNK_SIZE : ((uint32_t)dim_size - offset);
-
                 __memcpy(nram_data, row_input + offset,
                          len * sizeof(float), GDRAM2NRAM);
-
-                uint32_t reduce_len = 1;
-                while (reduce_len < len) reduce_len <<= 1;
-
-                for (uint32_t i = len; i < reduce_len; i++) {
-                    nram_data[i] = nram_data[0];
-                }
-
-                for (uint32_t step = reduce_len / 2; step > 0; step /= 2) {
-                    __bang_max(nram_data, nram_data, nram_data + step, step);
-                }
-
-                if (nram_data[0] > row_max) {
-                    row_max = nram_data[0];
+                for (uint32_t i = 0; i < len; i++) {
+                    if (nram_data[i] > row_max) {
+                        row_max = nram_data[i];
+                    }
                 }
             }
 
@@ -60,48 +106,28 @@ __mlu_entry__ void log_softmax_kernel(
             for (uint32_t offset = 0; offset < (uint32_t)dim_size; offset += CHUNK_SIZE) {
                 uint32_t len = (offset + CHUNK_SIZE <= (uint32_t)dim_size)
                                ? CHUNK_SIZE : ((uint32_t)dim_size - offset);
-
                 __memcpy(nram_data, row_input + offset,
                          len * sizeof(float), GDRAM2NRAM);
-
-                uint32_t reduce_len = 1;
-                while (reduce_len < len) reduce_len <<= 1;
-
-                for (uint32_t i = 0; i < reduce_len; i++) {
-                    nram_temp[i] = row_max;
+                for (uint32_t i = 0; i < len; i++) {
+                    row_sum_exp += fast_exp(nram_data[i] - row_max);
                 }
-                __bang_sub(nram_data, nram_data, nram_temp, reduce_len);
-
-                __bang_active_exp(nram_data, nram_data, reduce_len);
-
-                for (uint32_t i = len; i < reduce_len; i++) {
-                    nram_data[i] = 0.0f;
-                }
-
-                for (uint32_t step = reduce_len / 2; step > 0; step /= 2) {
-                    __bang_add(nram_data, nram_data, nram_data + step, step);
-                }
-
-                row_sum_exp += nram_data[0];
             }
 
-            float log_sum_exp = logf(row_sum_exp + 1e-10f);
+            float log_sum_exp = fast_log(row_sum_exp);
             float bias = row_max + log_sum_exp;
 
             for (uint32_t offset = 0; offset < (uint32_t)dim_size; offset += CHUNK_SIZE) {
                 uint32_t len = (offset + CHUNK_SIZE <= (uint32_t)dim_size)
                                ? CHUNK_SIZE : ((uint32_t)dim_size - offset);
+                uint32_t aligned_len = (len + 63) & ~63;
 
                 __memcpy(nram_data, row_input + offset,
                          len * sizeof(float), GDRAM2NRAM);
 
-                uint32_t reduce_len = 1;
-                while (reduce_len < len) reduce_len <<= 1;
-
-                for (uint32_t i = 0; i < reduce_len; i++) {
+                for (uint32_t i = 0; i < aligned_len; i++) {
                     nram_temp[i] = bias;
                 }
-                __bang_sub(nram_data, nram_data, nram_temp, reduce_len);
+                __bang_sub(nram_data, nram_data, nram_temp, aligned_len);
 
                 __memcpy(row_output + offset, nram_data,
                          len * sizeof(float), NRAM2GDRAM);
@@ -119,7 +145,6 @@ __mlu_entry__ void log_softmax_kernel(
                              (core_id < remainder ? 1 : 0);
 
         __nram__ float nram_col[CHUNK_SIZE];
-        __nram__ float nram_temp[CHUNK_SIZE];
 
         for (uint32_t c = 0; c < col_count; c++) {
             uint32_t col_idx = col_start + c;
@@ -132,39 +157,26 @@ __mlu_entry__ void log_softmax_kernel(
 
             float col_max = nram_col[0];
             for (uint32_t i = 1; i < (uint32_t)batch_size; i++) {
-                if (nram_col[i] > col_max) col_max = nram_col[i];
+                if (nram_col[i] > col_max) {
+                    col_max = nram_col[i];
+                }
             }
-
-            uint32_t reduce_len = 1;
-            while (reduce_len < (uint32_t)batch_size) reduce_len <<= 1;
-
-            for (uint32_t i = 0; i < reduce_len; i++) {
-                nram_temp[i] = col_max;
-            }
-            for (uint32_t i = batch_size; i < reduce_len; i++) {
-                nram_col[i] = col_max;
-            }
-
-            __bang_sub(nram_col, nram_col, nram_temp, reduce_len);
-            __bang_active_exp(nram_col, nram_col, reduce_len);
 
             float col_sum_exp = 0.0f;
             for (uint32_t i = 0; i < (uint32_t)batch_size; i++) {
-                col_sum_exp += nram_col[i];
+                col_sum_exp += fast_exp(nram_col[i] - col_max);
             }
 
-            float log_sum_exp = logf(col_sum_exp + 1e-10f);
+            float log_sum_exp = fast_log(col_sum_exp);
+            float bias = col_max + log_sum_exp;
 
             for (uint32_t r = 0; r < (uint32_t)batch_size; r++) {
-                __memcpy(nram_temp + r,
-                         input + r * dim_size + col_idx,
-                         sizeof(float), GDRAM2NRAM);
-                nram_temp[r] = nram_temp[r] - col_max - log_sum_exp;
+                nram_col[r] = nram_col[r] - bias;
             }
 
             for (uint32_t r = 0; r < (uint32_t)batch_size; r++) {
                 __memcpy(output + r * dim_size + col_idx,
-                         nram_temp + r,
+                         nram_col + r,
                          sizeof(float), NRAM2GDRAM);
             }
         }
