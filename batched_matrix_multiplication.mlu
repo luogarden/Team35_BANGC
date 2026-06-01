@@ -2,48 +2,84 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define TASK_NUM 16
-#define K_TILE 2048
+#define M_TILE 16
+#define K_TILE 256
+#define N_TILE 128
+#define TASK_NUM 32
 
-__mlu_entry__ void bmm_kernel(float *A, float *B, float *C,
-                              int batch, int m, int k, int n) {
-    int total = batch * m * n;
-    __nram__ float nram_a[K_TILE];
-    __nram__ float nram_b[K_TILE];
-    __nram__ float nram_prod[K_TILE];
+__mlu_entry__ void bmm_kernel(
+    half *A,
+    half *B,
+    half *C,
+    int batch,
+    int m,
+    int k,
+    int n) {
 
-    for (int idx = taskId; idx < total; idx += taskDim) {
-        int col = idx % n;
-        int t = idx / n;
-        int row = t % m;
-        int b = t / m;
+    int row_tiles = (m + M_TILE - 1) / M_TILE;
+    int col_tiles = (n + N_TILE - 1) / N_TILE;
+    int tiles_per_batch = row_tiles * col_tiles;
+    int total_tiles = batch * tiles_per_batch;
 
-        float sum = 0.0f;
-        for (int start = 0; start < k; start += K_TILE) {
-            int len = (start + K_TILE <= k) ? K_TILE : (k - start);
-            int aligned_len = (len + 63) & ~63;
+    __nram__ half left_nram[M_TILE * K_TILE];
+    __wram__ half right_wram[K_TILE * N_TILE];
+    __nram__ half partial_nram[M_TILE * N_TILE];
+    __nram__ half accum_nram[M_TILE * N_TILE];
 
-            __memcpy(nram_a, A + (b * m + row) * k + start,
-                     len * sizeof(float), GDRAM2NRAM);
+    for (int tile = taskId; tile < total_tiles; tile += taskDim) {
+        int b = tile / tiles_per_batch;
+        int tile_in_batch = tile - b * tiles_per_batch;
+        int row_tile = tile_in_batch / col_tiles;
+        int col_tile = tile_in_batch - row_tile * col_tiles;
 
-            for (int kk = 0; kk < len; ++kk) {
-                __memcpy(nram_b + kk,
-                         B + (b * k + start + kk) * n + col,
-                         sizeof(float),
+        int row_start = row_tile * M_TILE;
+        int col_start = col_tile * N_TILE;
+        int m_size = (row_start + M_TILE <= m) ? M_TILE : (m - row_start);
+        int n_size = (col_start + N_TILE <= n) ? N_TILE : (n - col_start);
+
+        for (int k_start = 0; k_start < k; k_start += K_TILE) {
+            int k_size = (k_start + K_TILE <= k) ? K_TILE : (k - k_start);
+
+            for (int row = 0; row < m_size; ++row) {
+                __memcpy(left_nram + row * k_size,
+                         A + (b * m + row_start + row) * k + k_start,
+                         k_size * sizeof(half),
                          GDRAM2NRAM);
             }
 
-            for (int i = len; i < aligned_len; ++i) {
-                nram_a[i] = 0.0f;
-                nram_b[i] = 0.0f;
+            for (int kk = 0; kk < k_size; ++kk) {
+                __memcpy(right_wram + kk * n_size,
+                         B + (b * k + k_start + kk) * n + col_start,
+                         n_size * sizeof(half),
+                         GDRAM2WRAM);
             }
 
-            __bang_mul(nram_prod, nram_a, nram_b, aligned_len);
-            sum += __bang_sum(nram_prod, aligned_len);
+            __bang_matmul(partial_nram,
+                          left_nram,
+                          right_wram,
+                          m_size,
+                          k_size,
+                          n_size);
+
+            if (k_start == 0) {
+                __memcpy(accum_nram,
+                         partial_nram,
+                         m_size * n_size * sizeof(half),
+                         NRAM2NRAM);
+            } else {
+                __bang_add(accum_nram,
+                           accum_nram,
+                           partial_nram,
+                           m_size * n_size);
+            }
         }
 
-        nram_prod[0] = sum;
-        __memcpy(C + idx, nram_prod, sizeof(float), NRAM2GDRAM);
+        for (int row = 0; row < m_size; ++row) {
+            __memcpy(C + (b * m + row_start + row) * n + col_start,
+                     accum_nram + row * n_size,
+                     n_size * sizeof(half),
+                     NRAM2GDRAM);
+        }
     }
 }
 
@@ -55,23 +91,34 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(A.size(0) == B.size(0), "batch dimensions must match");
     TORCH_CHECK(A.size(2) == B.size(1), "A.size(2) must equal B.size(1)");
 
-    torch::Tensor A_fp32 = A;
-    torch::Tensor B_fp32 = B;
-    if (A_fp32.scalar_type() != torch::kFloat) A_fp32 = A_fp32.to(torch::kFloat);
-    if (B_fp32.scalar_type() != torch::kFloat) B_fp32 = B_fp32.to(torch::kFloat);
+    torch::Tensor A_half = A;
+    torch::Tensor B_half = B;
+    if (A_half.scalar_type() != torch::kHalf) {
+        A_half = A_half.to(torch::kHalf);
+    }
+    if (B_half.scalar_type() != torch::kHalf) {
+        B_half = B_half.to(torch::kHalf);
+    }
 
-    int batch = (int)A_fp32.size(0);
-    int m = (int)A_fp32.size(1);
-    int k = (int)A_fp32.size(2);
-    int n = (int)B_fp32.size(2);
-    auto C_fp32 = torch::empty({(int64_t)batch, (int64_t)m, (int64_t)n},
-                               A_fp32.options());
+    int batch = (int)A_half.size(0);
+    int m = (int)A_half.size(1);
+    int k = (int)A_half.size(2);
+    int n = (int)B_half.size(2);
+
+    auto C_half = torch::empty({(int64_t)batch, (int64_t)m, (int64_t)n},
+                               A_half.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {TASK_NUM, 1, 1};
     bmm_kernel<<<dim, CNRT_FUNC_TYPE_BLOCK, queue>>>(
-        A_fp32.data_ptr<float>(), B_fp32.data_ptr<float>(),
-        C_fp32.data_ptr<float>(), batch, m, k, n);
+        reinterpret_cast<half *>(A_half.data_ptr()),
+        reinterpret_cast<half *>(B_half.data_ptr()),
+        reinterpret_cast<half *>(C_half.data_ptr()),
+        batch,
+        m,
+        k,
+        n);
 
-    return C_fp32;
+    cnrtQueueSync(queue);
+    return C_half.to(torch::kFloat);
 }
