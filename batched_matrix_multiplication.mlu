@@ -64,6 +64,7 @@ __mlu_entry__ void bmm_kernel(
 
             // 3. 【最核心修正点】M、N轴保持平铺满尺寸，将行跨步 Stride 牢牢锁死在 128 个元素，防范硬件卡死；
             // 计算轴引入精细裁剪的 k_size，在点积规约内部强制截断，彻底抹除 WRAM 垃圾极值的影响！
+            __bang_write_value(partial_nram, M_TILE * N_TILE, 0.0f);
             __bang_matmul(partial_nram,
                           left_nram,
                           right_wram,
