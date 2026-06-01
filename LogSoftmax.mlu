@@ -1,0 +1,215 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <cmath>
+
+#define CHUNK_SIZE 4096
+#define NEG_INF (-3.4028234663852886e38F)
+
+__mlu_entry__ void log_softmax_kernel(
+    float *input,
+    float *output,
+    int batch_size,
+    int dim_size,
+    int reduce_dim) {
+
+    if (reduce_dim == 1) {
+        uint32_t core_id = taskId;
+        uint32_t core_num = taskDim;
+        uint32_t rows_per_core = batch_size / core_num;
+        uint32_t remainder = batch_size % core_num;
+
+        uint32_t row_start = core_id * rows_per_core +
+                             (core_id < remainder ? core_id : remainder);
+        uint32_t row_count = rows_per_core +
+                             (core_id < remainder ? 1 : 0);
+
+        __nram__ float nram_data[CHUNK_SIZE];
+        __nram__ float nram_temp[CHUNK_SIZE];
+
+        for (uint32_t r = 0; r < row_count; r++) {
+            uint32_t row_idx = row_start + r;
+            float *row_input = input + row_idx * dim_size;
+            float *row_output = output + row_idx * dim_size;
+
+            float row_max = NEG_INF;
+            for (uint32_t offset = 0; offset < (uint32_t)dim_size; offset += CHUNK_SIZE) {
+                uint32_t len = (offset + CHUNK_SIZE <= (uint32_t)dim_size)
+                               ? CHUNK_SIZE : ((uint32_t)dim_size - offset);
+
+                __memcpy(nram_data, row_input + offset,
+                         len * sizeof(float), GDRAM2NRAM);
+
+                uint32_t reduce_len = 1;
+                while (reduce_len < len) reduce_len <<= 1;
+
+                for (uint32_t i = len; i < reduce_len; i++) {
+                    nram_data[i] = nram_data[0];
+                }
+
+                for (uint32_t step = reduce_len / 2; step > 0; step /= 2) {
+                    __bang_max(nram_data, nram_data, nram_data + step, step);
+                }
+
+                if (nram_data[0] > row_max) {
+                    row_max = nram_data[0];
+                }
+            }
+
+            float row_sum_exp = 0.0f;
+            for (uint32_t offset = 0; offset < (uint32_t)dim_size; offset += CHUNK_SIZE) {
+                uint32_t len = (offset + CHUNK_SIZE <= (uint32_t)dim_size)
+                               ? CHUNK_SIZE : ((uint32_t)dim_size - offset);
+
+                __memcpy(nram_data, row_input + offset,
+                         len * sizeof(float), GDRAM2NRAM);
+
+                uint32_t reduce_len = 1;
+                while (reduce_len < len) reduce_len <<= 1;
+
+                for (uint32_t i = 0; i < reduce_len; i++) {
+                    nram_temp[i] = row_max;
+                }
+                __bang_sub(nram_data, nram_data, nram_temp, reduce_len);
+
+                __bang_active_exp(nram_data, nram_data, reduce_len);
+
+                for (uint32_t i = len; i < reduce_len; i++) {
+                    nram_data[i] = 0.0f;
+                }
+
+                for (uint32_t step = reduce_len / 2; step > 0; step /= 2) {
+                    __bang_add(nram_data, nram_data, nram_data + step, step);
+                }
+
+                row_sum_exp += nram_data[0];
+            }
+
+            float log_sum_exp = logf(row_sum_exp + 1e-10f);
+            float bias = row_max + log_sum_exp;
+
+            for (uint32_t offset = 0; offset < (uint32_t)dim_size; offset += CHUNK_SIZE) {
+                uint32_t len = (offset + CHUNK_SIZE <= (uint32_t)dim_size)
+                               ? CHUNK_SIZE : ((uint32_t)dim_size - offset);
+
+                __memcpy(nram_data, row_input + offset,
+                         len * sizeof(float), GDRAM2NRAM);
+
+                uint32_t reduce_len = 1;
+                while (reduce_len < len) reduce_len <<= 1;
+
+                for (uint32_t i = 0; i < reduce_len; i++) {
+                    nram_temp[i] = bias;
+                }
+                __bang_sub(nram_data, nram_data, nram_temp, reduce_len);
+
+                __memcpy(row_output + offset, nram_data,
+                         len * sizeof(float), NRAM2GDRAM);
+            }
+        }
+    } else {
+        uint32_t core_id = taskId;
+        uint32_t core_num = taskDim;
+        uint32_t cols_per_core = dim_size / core_num;
+        uint32_t remainder = dim_size % core_num;
+
+        uint32_t col_start = core_id * cols_per_core +
+                             (core_id < remainder ? core_id : remainder);
+        uint32_t col_count = cols_per_core +
+                             (core_id < remainder ? 1 : 0);
+
+        __nram__ float nram_col[CHUNK_SIZE];
+        __nram__ float nram_temp[CHUNK_SIZE];
+
+        for (uint32_t c = 0; c < col_count; c++) {
+            uint32_t col_idx = col_start + c;
+
+            for (uint32_t r = 0; r < (uint32_t)batch_size; r++) {
+                __memcpy(nram_col + r,
+                         input + r * dim_size + col_idx,
+                         sizeof(float), GDRAM2NRAM);
+            }
+
+            float col_max = nram_col[0];
+            for (uint32_t i = 1; i < (uint32_t)batch_size; i++) {
+                if (nram_col[i] > col_max) col_max = nram_col[i];
+            }
+
+            uint32_t reduce_len = 1;
+            while (reduce_len < (uint32_t)batch_size) reduce_len <<= 1;
+
+            for (uint32_t i = 0; i < reduce_len; i++) {
+                nram_temp[i] = col_max;
+            }
+            for (uint32_t i = batch_size; i < reduce_len; i++) {
+                nram_col[i] = col_max;
+            }
+
+            __bang_sub(nram_col, nram_col, nram_temp, reduce_len);
+            __bang_active_exp(nram_col, nram_col, reduce_len);
+
+            float col_sum_exp = 0.0f;
+            for (uint32_t i = 0; i < (uint32_t)batch_size; i++) {
+                col_sum_exp += nram_col[i];
+            }
+
+            float log_sum_exp = logf(col_sum_exp + 1e-10f);
+
+            for (uint32_t r = 0; r < (uint32_t)batch_size; r++) {
+                __memcpy(nram_temp + r,
+                         input + r * dim_size + col_idx,
+                         sizeof(float), GDRAM2NRAM);
+                nram_temp[r] = nram_temp[r] - col_max - log_sum_exp;
+            }
+
+            for (uint32_t r = 0; r < (uint32_t)batch_size; r++) {
+                __memcpy(output + r * dim_size + col_idx,
+                         nram_temp + r,
+                         sizeof(float), NRAM2GDRAM);
+            }
+        }
+    }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor input,
+    int dim) {
+
+    TORCH_CHECK(input.is_contiguous(),
+                "Input must be contiguous");
+    TORCH_CHECK(input.dim() == 2,
+                "Input must be a 2D tensor");
+
+    int axis = dim < 0 ? dim + 2 : dim;
+    TORCH_CHECK(axis == 0 || axis == 1,
+                "dim must be 0, 1, -1, or -2");
+
+    auto original_dtype = input.scalar_type();
+
+    torch::Tensor input_fp32 = input;
+    if (original_dtype != torch::kFloat) {
+        input_fp32 = input.to(torch::kFloat);
+    }
+
+    auto output_fp32 = torch::empty_like(input_fp32);
+
+    int batch_size = (int)input_fp32.size(0);
+    int dim_size = (int)input_fp32.size(1);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch_dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    log_softmax_kernel<<<launch_dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch_size,
+        dim_size,
+        axis);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
