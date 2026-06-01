@@ -1,0 +1,59 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define TASK_NUM 16
+
+__mlu_entry__ void bmm_kernel(float *A, float *B, float *C,
+                              int batch, int m, int k, int n) {
+    int total = batch * m * n;
+    __nram__ float tmp[2];
+
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        int col = idx % n;
+        int t = idx / n;
+        int row = t % m;
+        int b = t / m;
+
+        float sum = 0.0f;
+        for (int kk = 0; kk < k; ++kk) {
+            __memcpy(tmp, A + (b * m + row) * k + kk,
+                     sizeof(float), GDRAM2NRAM);
+            __memcpy(tmp + 1, B + (b * k + kk) * n + col,
+                     sizeof(float), GDRAM2NRAM);
+            sum += tmp[0] * tmp[1];
+        }
+
+        tmp[0] = sum;
+        __memcpy(C + idx, tmp, sizeof(float), NRAM2GDRAM);
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
+    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
+    TORCH_CHECK(A.dim() == 3, "A must be a 3D tensor");
+    TORCH_CHECK(B.dim() == 3, "B must be a 3D tensor");
+    TORCH_CHECK(A.size(0) == B.size(0), "batch dimensions must match");
+    TORCH_CHECK(A.size(2) == B.size(1), "A.size(2) must equal B.size(1)");
+
+    torch::Tensor A_fp32 = A;
+    torch::Tensor B_fp32 = B;
+    if (A_fp32.scalar_type() != torch::kFloat) A_fp32 = A_fp32.to(torch::kFloat);
+    if (B_fp32.scalar_type() != torch::kFloat) B_fp32 = B_fp32.to(torch::kFloat);
+
+    int batch = (int)A_fp32.size(0);
+    int m = (int)A_fp32.size(1);
+    int k = (int)A_fp32.size(2);
+    int n = (int)B_fp32.size(2);
+    auto C_fp32 = torch::empty({(int64_t)batch, (int64_t)m, (int64_t)n},
+                               A_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {TASK_NUM, 1, 1};
+    bmm_kernel<<<dim, CNRT_FUNC_TYPE_BLOCK, queue>>>(
+        A_fp32.data_ptr<float>(), B_fp32.data_ptr<float>(),
+        C_fp32.data_ptr<float>(), batch, m, k, n);
+
+    return C_fp32;
+}

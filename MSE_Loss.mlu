@@ -1,0 +1,85 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+#define TASK_NUM 16
+
+__mlu_entry__ void mse_partial_kernel(float *predictions, float *targets,
+                                      float *partial_sums, int total) {
+    int core_id = taskId;
+    int core_num = taskDim;
+    int per_core = total / core_num;
+    int remainder = total % core_num;
+    int start = core_id * per_core + (core_id < remainder ? core_id : remainder);
+    int count = per_core + (core_id < remainder ? 1 : 0);
+
+    __nram__ float pred_buf[CHUNK_SIZE];
+    __nram__ float target_buf[CHUNK_SIZE];
+    __nram__ float out_buf[1];
+
+    float sum = 0.0f;
+    for (int offset = 0; offset < count; offset += CHUNK_SIZE) {
+        int len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
+        __memcpy(pred_buf, predictions + start + offset,
+                 len * sizeof(float), GDRAM2NRAM);
+        __memcpy(target_buf, targets + start + offset,
+                 len * sizeof(float), GDRAM2NRAM);
+
+        for (int i = 0; i < len; ++i) {
+            float diff = pred_buf[i] - target_buf[i];
+            sum += diff * diff;
+        }
+    }
+
+    out_buf[0] = sum;
+    __memcpy(partial_sums + core_id, out_buf, sizeof(float), NRAM2GDRAM);
+}
+
+__mlu_entry__ void mse_finalize_kernel(float *partial_sums, float *output,
+                                       int total) {
+    if (taskId != 0) return;
+
+    __nram__ float partial_buf[TASK_NUM];
+    __memcpy(partial_buf, partial_sums,
+             TASK_NUM * sizeof(float), GDRAM2NRAM);
+
+    float sum = 0.0f;
+    for (int i = 0; i < TASK_NUM; ++i) sum += partial_buf[i];
+
+    partial_buf[0] = sum / (float)total;
+    __memcpy(output, partial_buf, sizeof(float), NRAM2GDRAM);
+}
+
+torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
+    TORCH_CHECK(predictions.is_contiguous(), "predictions must be contiguous");
+    TORCH_CHECK(targets.is_contiguous(), "targets must be contiguous");
+    TORCH_CHECK(predictions.dim() == 2, "predictions must be a 2D tensor");
+    TORCH_CHECK(targets.dim() == 2, "targets must be a 2D tensor");
+    TORCH_CHECK(predictions.size(0) == targets.size(0) &&
+                predictions.size(1) == targets.size(1),
+                "predictions and targets must have the same shape");
+
+    torch::Tensor predictions_fp32 = predictions;
+    torch::Tensor targets_fp32 = targets;
+    if (predictions_fp32.scalar_type() != torch::kFloat) {
+        predictions_fp32 = predictions_fp32.to(torch::kFloat);
+    }
+    if (targets_fp32.scalar_type() != torch::kFloat) {
+        targets_fp32 = targets_fp32.to(torch::kFloat);
+    }
+
+    int total = (int)predictions_fp32.numel();
+    auto partial_sums = torch::empty({TASK_NUM}, predictions_fp32.options());
+    auto output_fp32 = torch::empty({}, predictions_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {TASK_NUM, 1, 1};
+    mse_partial_kernel<<<dim, CNRT_FUNC_TYPE_BLOCK, queue>>>(
+        predictions_fp32.data_ptr<float>(), targets_fp32.data_ptr<float>(),
+        partial_sums.data_ptr<float>(), total);
+    mse_finalize_kernel<<<dim, CNRT_FUNC_TYPE_BLOCK, queue>>>(
+        partial_sums.data_ptr<float>(), output_fp32.data_ptr<float>(), total);
+
+    return output_fp32;
+}

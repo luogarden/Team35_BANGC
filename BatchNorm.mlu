@@ -1,0 +1,66 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <math.h>
+
+#define TASK_NUM 16
+#define BN_EPS 1.0e-5f
+
+__mlu_entry__ void batchnorm2d_kernel(float *x, float *output,
+                                      int batch, int channels,
+                                      int height, int width) {
+    int spatial = height * width;
+    int channel_count = batch * spatial;
+    __nram__ float buf[1];
+
+    for (int c = taskId; c < channels; c += taskDim) {
+        float sum = 0.0f;
+        for (int b = 0; b < batch; ++b) {
+            for (int s = 0; s < spatial; ++s) {
+                int idx = ((b * channels + c) * spatial) + s;
+                __memcpy(buf, x + idx, sizeof(float), GDRAM2NRAM);
+                sum += buf[0];
+            }
+        }
+
+        float mean = sum / (float)channel_count;
+        float var_sum = 0.0f;
+        for (int b = 0; b < batch; ++b) {
+            for (int s = 0; s < spatial; ++s) {
+                int idx = ((b * channels + c) * spatial) + s;
+                __memcpy(buf, x + idx, sizeof(float), GDRAM2NRAM);
+                float diff = buf[0] - mean;
+                var_sum += diff * diff;
+            }
+        }
+
+        float inv_std = 1.0f / sqrtf(var_sum / (float)channel_count + BN_EPS);
+        for (int b = 0; b < batch; ++b) {
+            for (int s = 0; s < spatial; ++s) {
+                int idx = ((b * channels + c) * spatial) + s;
+                __memcpy(buf, x + idx, sizeof(float), GDRAM2NRAM);
+                buf[0] = (buf[0] - mean) * inv_std;
+                __memcpy(output + idx, buf, sizeof(float), NRAM2GDRAM);
+            }
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int num_features) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 4, "x must be a 4D tensor");
+    TORCH_CHECK(x.size(1) == num_features, "num_features must match x.size(1)");
+
+    torch::Tensor x_fp32 = x;
+    if (x_fp32.scalar_type() != torch::kFloat) x_fp32 = x_fp32.to(torch::kFloat);
+    auto output_fp32 = torch::empty_like(x_fp32);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {TASK_NUM, 1, 1};
+    batchnorm2d_kernel<<<dim, CNRT_FUNC_TYPE_BLOCK, queue>>>(
+        x_fp32.data_ptr<float>(), output_fp32.data_ptr<float>(),
+        (int)x_fp32.size(0), (int)x_fp32.size(1),
+        (int)x_fp32.size(2), (int)x_fp32.size(3));
+
+    return output_fp32;
+}

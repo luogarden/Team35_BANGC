@@ -1,0 +1,47 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define TASK_NUM 16
+
+__mlu_entry__ void gemv_kernel(float *A, float *B, float *C, int m, int k) {
+    __nram__ float tmp[2];
+
+    for (int row = taskId; row < m; row += taskDim) {
+        float sum = 0.0f;
+        for (int kk = 0; kk < k; ++kk) {
+            __memcpy(tmp, A + row * k + kk, sizeof(float), GDRAM2NRAM);
+            __memcpy(tmp + 1, B + kk, sizeof(float), GDRAM2NRAM);
+            sum += tmp[0] * tmp[1];
+        }
+
+        tmp[0] = sum;
+        __memcpy(C + row, tmp, sizeof(float), NRAM2GDRAM);
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
+    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
+    TORCH_CHECK(A.dim() == 2, "A must be a 2D tensor");
+    TORCH_CHECK(B.dim() == 2, "B must be a 2D tensor");
+    TORCH_CHECK(B.size(1) == 1, "B must have shape [K, 1]");
+    TORCH_CHECK(A.size(1) == B.size(0), "A.size(1) must equal B.size(0)");
+
+    torch::Tensor A_fp32 = A;
+    torch::Tensor B_fp32 = B;
+    if (A_fp32.scalar_type() != torch::kFloat) A_fp32 = A_fp32.to(torch::kFloat);
+    if (B_fp32.scalar_type() != torch::kFloat) B_fp32 = B_fp32.to(torch::kFloat);
+
+    int m = (int)A_fp32.size(0);
+    int k = (int)A_fp32.size(1);
+    auto C_fp32 = torch::empty({(int64_t)m, 1}, A_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {TASK_NUM, 1, 1};
+    gemv_kernel<<<dim, CNRT_FUNC_TYPE_BLOCK, queue>>>(
+        A_fp32.data_ptr<float>(), B_fp32.data_ptr<float>(),
+        C_fp32.data_ptr<float>(), m, k);
+
+    return C_fp32;
+}

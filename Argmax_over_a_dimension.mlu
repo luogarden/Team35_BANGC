@@ -1,0 +1,74 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <vector>
+
+#define TASK_NUM 16
+#define NEG_INF (-3.4028234663852886e38F)
+
+__mlu_entry__ void argmax_dim_kernel(float *input, int64_t *output,
+                                     int outer, int reduce, int inner) {
+    int total = outer * inner;
+    __nram__ float value_buf[1];
+    __nram__ int64_t index_buf[1];
+
+    for (int out_idx = taskId; out_idx < total; out_idx += taskDim) {
+        int outer_idx = out_idx / inner;
+        int inner_idx = out_idx - outer_idx * inner;
+        int base = outer_idx * reduce * inner + inner_idx;
+        float best = NEG_INF;
+        int best_index = 0;
+
+        for (int r = 0; r < reduce; ++r) {
+            __memcpy(value_buf, input + base + r * inner,
+                     sizeof(float), GDRAM2NRAM);
+            float cur = value_buf[0];
+            if (cur > best) {
+                best = cur;
+                best_index = r;
+            }
+        }
+
+        index_buf[0] = (int64_t)best_index;
+        __memcpy(output + out_idx, index_buf, sizeof(int64_t), NRAM2GDRAM);
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() >= 1, "x must have at least one dimension");
+
+    int ndim = (int)x.dim();
+    int axis = dim < 0 ? dim + ndim : dim;
+    TORCH_CHECK(axis >= 0 && axis < ndim, "dim is out of range");
+
+    int outer = 1;
+    int reduce = (int)x.size(axis);
+    int inner = 1;
+    for (int i = 0; i < axis; ++i) outer *= (int)x.size(i);
+    for (int i = axis + 1; i < ndim; ++i) inner *= (int)x.size(i);
+
+    torch::Tensor input_fp32 = x;
+    if (input_fp32.scalar_type() != torch::kFloat) {
+        input_fp32 = input_fp32.to(torch::kFloat);
+    }
+
+    std::vector<int64_t> output_shape;
+    for (int i = 0; i < ndim; ++i) {
+        if (i != axis) output_shape.push_back(x.size(i));
+    }
+
+    auto index_options = x.options().dtype(torch::kLong);
+    torch::Tensor output = output_shape.empty()
+        ? torch::empty({}, index_options)
+        : torch::empty(output_shape, index_options);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch_dim = {TASK_NUM, 1, 1};
+    argmax_dim_kernel<<<launch_dim, CNRT_FUNC_TYPE_BLOCK, queue>>>(
+        input_fp32.data_ptr<float>(), output.data_ptr<int64_t>(),
+        outer, reduce, inner);
+
+    return output;
+}

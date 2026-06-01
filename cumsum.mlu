@@ -1,0 +1,53 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define TASK_NUM 16
+
+__mlu_entry__ void cumsum_dim_kernel(float *x, float *output,
+                                     int outer, int reduce, int inner) {
+    int lines = outer * inner;
+    __nram__ float buf[1];
+
+    for (int line = taskId; line < lines; line += taskDim) {
+        int outer_idx = line / inner;
+        int inner_idx = line - outer_idx * inner;
+        int base = outer_idx * reduce * inner + inner_idx;
+        float sum = 0.0f;
+
+        for (int r = 0; r < reduce; ++r) {
+            int idx = base + r * inner;
+            __memcpy(buf, x + idx, sizeof(float), GDRAM2NRAM);
+            sum += buf[0];
+            buf[0] = sum;
+            __memcpy(output + idx, buf, sizeof(float), NRAM2GDRAM);
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() >= 1, "x must have at least one dimension");
+
+    int ndim = (int)x.dim();
+    int axis = dim < 0 ? dim + ndim : dim;
+    TORCH_CHECK(axis >= 0 && axis < ndim, "dim is out of range");
+
+    int outer = 1;
+    int reduce = (int)x.size(axis);
+    int inner = 1;
+    for (int i = 0; i < axis; ++i) outer *= (int)x.size(i);
+    for (int i = axis + 1; i < ndim; ++i) inner *= (int)x.size(i);
+
+    torch::Tensor x_fp32 = x;
+    if (x_fp32.scalar_type() != torch::kFloat) x_fp32 = x_fp32.to(torch::kFloat);
+    auto output_fp32 = torch::empty_like(x_fp32);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch_dim = {TASK_NUM, 1, 1};
+    cumsum_dim_kernel<<<launch_dim, CNRT_FUNC_TYPE_BLOCK, queue>>>(
+        x_fp32.data_ptr<float>(), output_fp32.data_ptr<float>(),
+        outer, reduce, inner);
+
+    return output_fp32;
+}
