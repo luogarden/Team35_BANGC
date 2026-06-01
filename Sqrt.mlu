@@ -1,6 +1,4 @@
 #include <bang.h>
-#include <torch/extension.h>
-#include <cnrt.h>
 
 #define CHUNK_SIZE 4096
 
@@ -25,33 +23,61 @@ __mlu_entry__ void sqrt_kernel(
 
     __nram__ float buf[CHUNK_SIZE];
 
-    for (uint32_t offset = 0;
-         offset < count;
-         offset += CHUNK_SIZE) {
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
 
         uint32_t len =
             (offset + CHUNK_SIZE <= count)
                 ? CHUNK_SIZE
                 : (count - offset);
 
-        __memcpy(
-            buf,
-            input + start + offset,
-            len * sizeof(float),
-            GDRAM2NRAM);
+        __memcpy(buf,
+                 input + start + offset,
+                 len * sizeof(float),
+                 GDRAM2NRAM);
 
-        // 🔥 KEY FIX：round UP to 64-aligned
+        // ✔ torch.sqrt semantics
         uint32_t aligned_len = (len + 63) & ~63;
 
-        __bang_active_sqrt(
-            buf,
-            buf,
-            aligned_len);
+        __bang_active_sqrt(buf, buf, aligned_len);
 
-        __memcpy(
-            output + start + offset,
-            buf,
-            len * sizeof(float),
-            NRAM2GDRAM);
+        __memcpy(output + start + offset,
+                 buf,
+                 len * sizeof(float),
+                 NRAM2GDRAM);
     }
 }
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+__attribute__((visibility("default")))
+torch::Tensor bang_func(torch::Tensor input) {
+
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+
+    auto x = input.to(torch::kFloat);
+    auto out = torch::empty_like(x);
+
+    int total = x.numel();
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    sqrt_kernel<<<dim, ktype, queue>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        total);
+
+    if (input.scalar_type() != torch::kFloat) {
+        return out.to(input.scalar_type());
+    }
+
+    return out;
+}
+
+#ifdef __cplusplus
+}
+#endif
