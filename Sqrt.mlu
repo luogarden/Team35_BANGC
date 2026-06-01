@@ -33,13 +33,11 @@ __mlu_entry__ void sqrt_kernel(
             len * sizeof(half),
             GDRAM2NRAM);
 
-        for (uint32_t i = 0; i < len; i++) {
-            // 先取绝对值，再求平方根
-            // BangC 提供 __fabs 和 __sqrt 内置函数
-            float val = (float)nram[i];
-            val = __fabsf(val);
-            nram[i] = (half)__sqrtf(val);
-        }
+        // 先取绝对值: abs(x)
+        __bang_active_abs(nram, nram, len);
+
+        // 再求平方根: sqrt(abs(x))
+        __bang_active_sqrt(nram, nram, len);
 
         __memcpy(
             output + start + offset,
