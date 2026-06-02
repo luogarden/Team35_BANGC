@@ -10,22 +10,18 @@ __mlu_entry__ void global_sum_kernel(
     int total) {
 
     uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t per_core = total / core_num;
-    uint32_t rem = total % core_num;
-    uint32_t start = core_id * per_core +
-                     (core_id < rem ? core_id : rem);
-    uint32_t count = per_core +
-                     (core_id < rem ? 1 : 0);
+    if (core_id != 0) {
+        return;
+    }
 
     __nram__ float nram[CHUNK_SIZE];
     float sum = 0.0f;
 
-    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
-        int len = (offset + CHUNK_SIZE <= count)
-                  ? CHUNK_SIZE : (count - offset);
+    for (int offset = 0; offset < total; offset += CHUNK_SIZE) {
+        int len = (offset + CHUNK_SIZE <= total)
+                  ? CHUNK_SIZE : (total - offset);
 
-        __memcpy(nram, input + start + offset,
+        __memcpy(nram, input + offset,
                  len * sizeof(float), GDRAM2NRAM);
 
         for (int i = 0; i < len; i++) {
@@ -34,7 +30,7 @@ __mlu_entry__ void global_sum_kernel(
     }
 
     nram[0] = sum;
-    __memcpy(output + core_id, nram, sizeof(float), NRAM2GDRAM);
+    __memcpy(output, nram, sizeof(float), NRAM2GDRAM);
 }
 
 
@@ -51,7 +47,7 @@ torch::Tensor bang_func(
     }
 
     int total = x_fp32.numel();
-    auto part = torch::empty({4}, x_fp32.options());
+    auto result = torch::empty({1}, x_fp32.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {4, 1, 1};
@@ -59,10 +55,8 @@ torch::Tensor bang_func(
 
     global_sum_kernel<<<dim, ktype, queue>>>(
         x_fp32.data_ptr<float>(),
-        part.data_ptr<float>(),
+        result.data_ptr<float>(),
         total);
-
-    auto result = part.sum();
 
     if (original_dtype != torch::kFloat) {
         result = result.to(original_dtype);
