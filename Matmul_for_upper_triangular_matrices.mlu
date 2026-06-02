@@ -1,0 +1,117 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define M_TILE 32
+#define N_TILE 128
+#define K_BLOCK 32
+#define TASK_NUM 32
+
+__mlu_entry__ void triu_matmul_kernel(
+    const float *A,
+    const float *B,
+    float *C,
+    int N) {
+
+    int row_tiles = (N + M_TILE - 1) / M_TILE;
+    int col_tiles = (N + N_TILE - 1) / N_TILE;
+    int total_tiles = row_tiles * col_tiles;
+
+    __nram__ float accum[M_TILE * N_TILE];
+    __nram__ float a_block[M_TILE * K_BLOCK];
+    __nram__ float b_block[K_BLOCK * N_TILE];
+    __nram__ float prod[M_TILE * N_TILE];
+    __nram__ float a_mat[M_TILE * N_TILE];
+    __nram__ float b_mat[M_TILE * N_TILE];
+
+    for (int tile = taskId; tile < total_tiles; tile += taskDim) {
+        int row_tile = tile / col_tiles;
+        int col_tile = tile - row_tile * col_tiles;
+        int row_start = row_tile * M_TILE;
+        int col_start = col_tile * N_TILE;
+        int m_size = (row_start + M_TILE <= N) ? M_TILE : (N - row_start);
+        int n_size = (col_start + N_TILE <= N) ? N_TILE : (N - col_start);
+
+        __bang_write_value(accum, M_TILE * N_TILE, 0.0f);
+
+        for (int k_block = 0; k_block < N; k_block += K_BLOCK) {
+            int actual_kb = (k_block + K_BLOCK <= N) ? K_BLOCK : (N - k_block);
+
+            for (int ki = 0; ki < actual_kb; ++ki) {
+                __memcpy(b_block + ki * N_TILE,
+                         B + (k_block + ki) * N + col_start,
+                         n_size * sizeof(float),
+                         GDRAM2NRAM);
+            }
+
+            for (int row = 0; row < m_size; ++row) {
+                __memcpy(a_block + row * K_BLOCK,
+                         A + (row_start + row) * N + k_block,
+                         actual_kb * sizeof(float),
+                         GDRAM2NRAM);
+            }
+
+            for (int ki = 0; ki < actual_kb; ++ki) {
+                for (int row = 0; row < m_size; ++row) {
+                    float a_val = a_block[row * K_BLOCK + ki];
+                    __bang_write_value(a_mat + row * N_TILE, n_size, a_val);
+                    __memcpy(b_mat + row * N_TILE,
+                             b_block + ki * N_TILE,
+                             n_size * sizeof(float),
+                             NRAM2NRAM);
+                }
+
+                __bang_mul(prod, a_mat, b_mat, M_TILE * N_TILE);
+                __bang_add(accum, accum, prod, M_TILE * N_TILE);
+            }
+        }
+
+        for (int row = 0; row < m_size; ++row) {
+            int global_row = row_start + row;
+            int max_col = global_row - col_start;
+            if (max_col > 0) {
+                __bang_write_value(accum + row * N_TILE, max_col, 0.0f);
+            }
+        }
+
+        for (int row = 0; row < m_size; ++row) {
+            __memcpy(C + (row_start + row) * N + col_start,
+                     accum + row * N_TILE,
+                     n_size * sizeof(float),
+                     NRAM2GDRAM);
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
+    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
+    TORCH_CHECK(A.dim() == 2, "A must be a 2D tensor");
+    TORCH_CHECK(B.dim() == 2, "B must be a 2D tensor");
+    TORCH_CHECK(A.size(0) == B.size(0), "A and B must have the same shape");
+    TORCH_CHECK(A.size(1) == B.size(1), "A and B must have the same shape");
+
+    torch::Tensor A_fp32 = A;
+    torch::Tensor B_fp32 = B;
+    if (A_fp32.scalar_type() != torch::kFloat) {
+        A_fp32 = A_fp32.to(torch::kFloat);
+    }
+    if (B_fp32.scalar_type() != torch::kFloat) {
+        B_fp32 = B_fp32.to(torch::kFloat);
+    }
+
+    int N = (int)A_fp32.size(0);
+
+    auto C_fp32 = torch::empty({(int64_t)N, (int64_t)N}, A_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {TASK_NUM, 1, 1};
+
+    triu_matmul_kernel<<<dim, CNRT_FUNC_TYPE_BLOCK, queue>>>(
+        A_fp32.data_ptr<float>(),
+        B_fp32.data_ptr<float>(),
+        C_fp32.data_ptr<float>(),
+        N);
+
+    return C_fp32;
+}
