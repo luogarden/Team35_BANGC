@@ -1,0 +1,103 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_entry__ void masked_fill_kernel(
+    half *x,
+    half *mask,
+    half *output,
+    half fill_value,
+    int total) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total / core_num;
+    uint32_t remainder = total % core_num;
+
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
+
+    __nram__ half nram_a[CHUNK_SIZE];
+    __nram__ half nram_b[CHUNK_SIZE];
+    __nram__ half nram_c[CHUNK_SIZE];
+
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
+
+        uint32_t len =
+            (offset + CHUNK_SIZE <= count)
+                ? CHUNK_SIZE
+                : (count - offset);
+
+        uint32_t aligned_len = (len + 63) & ~63;
+
+        __memcpy(nram_a, x + start + offset,
+                 len * sizeof(half), GDRAM2NRAM);
+        __memcpy(nram_b, mask + start + offset,
+                 len * sizeof(half), GDRAM2NRAM);
+
+        for (uint32_t i = len; i < aligned_len; i++) {
+            nram_a[i] = (half)0.0f;
+            nram_b[i] = (half)0.0f;
+        }
+
+        __bang_mul(nram_c, nram_a, nram_b, aligned_len);
+
+        __bang_sub(nram_a, nram_a, nram_c, aligned_len);
+
+        __bang_mul_scalar(nram_b, nram_b,
+                          fill_value, aligned_len);
+
+        __bang_add(nram_a, nram_a, nram_b, aligned_len);
+
+        __memcpy(output + start + offset, nram_a,
+                 len * sizeof(half), NRAM2GDRAM);
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor mask,
+    double fill_value) {
+
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(mask.is_contiguous(), "mask must be contiguous");
+    TORCH_CHECK(x.numel() == mask.numel(), "x and mask must have same size");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_half = x;
+    torch::Tensor mask_half = mask;
+
+    if (original_dtype != torch::kHalf) {
+        x_half = x.to(torch::kHalf);
+    }
+    if (mask.scalar_type() != torch::kHalf) {
+        mask_half = mask.to(torch::kHalf);
+    }
+
+    auto output_half = torch::empty_like(x_half);
+    int total = x_half.numel();
+    half fill_half = (half)(float)fill_value;
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    masked_fill_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<half*>(x_half.data_ptr()),
+        reinterpret_cast<half*>(mask_half.data_ptr()),
+        reinterpret_cast<half*>(output_half.data_ptr()),
+        fill_half,
+        total);
+
+    if (original_dtype != torch::kHalf) {
+        return output_half.to(original_dtype);
+    }
+
+    return output_half;
+}
