@@ -23,65 +23,55 @@ __mlu_entry__ void depthwise_separable_conv2d_kernel(
 
     int spatial = H * W;
     int out_spatial = H_out * W_out;
-    int total_out = batch * out_c * out_spatial;
+    int total_positions = batch * out_spatial;
     int kernel_area = K * K;
 
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t per_core = total_out / core_num;
-    uint32_t rem = total_out % core_num;
-    uint32_t start = core_id * per_core +
-                     (core_id < rem ? core_id : rem);
-    uint32_t count = per_core +
-                     (core_id < rem ? 1 : 0);
+    int total_dw = in_c * kernel_area;
+    int total_pw = out_c * in_c;
 
     __nram__ float nram_dw[CHUNK_SIZE];
     __nram__ float nram_pw[CHUNK_SIZE];
-    __nram__ float nram_row[CHUNK_SIZE];
+    __nram__ float nram_shared[CHUNK_SIZE];
 
-    for (uint32_t idx = 0; idx < count; idx++) {
-        uint32_t flat = start + idx;
-        int w_out = flat % W_out;
-        int tmp = flat / W_out;
-        int h_out = tmp % H_out;
-        int oc = (tmp / H_out) % out_c;
-        int b = tmp / H_out / out_c;
+    __memcpy(nram_dw, dw_kernel, total_dw * sizeof(float), GDRAM2NRAM);
+    __memcpy(nram_pw, pw_kernel, total_pw * sizeof(float), GDRAM2NRAM);
 
-        float sum = 0.0f;
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total_positions / core_num;
+    uint32_t rem = total_positions % core_num;
+    uint32_t p_start = core_id * per_core +
+                       (core_id < rem ? core_id : rem);
+    uint32_t p_count = per_core +
+                       (core_id < rem ? 1 : 0);
+
+    for (uint32_t p = 0; p < p_count; p++) {
+        uint32_t flat = p_start + p;
+        int pos = flat % out_spatial;
+        int b = flat / out_spatial;
+        int h_out = pos / W_out;
+        int w_out = pos % W_out;
+
+        int in_h_start = h_out * stride - padding;
+        int in_w_start = w_out * stride - padding;
 
         for (int c = 0; c < in_c; c++) {
-
-            float pw_val = 1.0f;
-            if (in_c <= CHUNK_SIZE) {
-                __memcpy(nram_pw, pw_kernel + oc * in_c,
-                         in_c * sizeof(float), GDRAM2NRAM);
-                pw_val = nram_pw[c];
-            } else {
-                __memcpy(nram_pw, pw_kernel + oc * in_c + c,
-                         sizeof(float), GDRAM2NRAM);
-                pw_val = nram_pw[0];
-            }
-
-            __memcpy(nram_dw, dw_kernel + c * kernel_area,
-                     kernel_area * sizeof(float), GDRAM2NRAM);
-
-            int in_h_start = h_out * stride - padding;
-            int in_w_start = w_out * stride - padding;
-            int plane_offset = (b * in_c + c) * spatial;
-
+            int plane_offset = (int)(b * in_c + c) * spatial;
+            float *dw = nram_dw + c * kernel_area;
             float dw_sum = 0.0f;
+
             for (int kh = 0; kh < K; kh++) {
                 int h_idx = in_h_start + kh * dilation;
 
                 if (h_idx >= 0 && h_idx < H &&
                     in_w_start >= 0 && in_w_start + K * dilation <= W) {
-                    __memcpy(nram_row,
+                    __memcpy(nram_shared,
                              x + plane_offset + h_idx * W + in_w_start,
                              K * dilation * sizeof(float),
                              GDRAM2NRAM);
                     for (int kw = 0; kw < K; kw++) {
-                        int w_idx = kw * dilation;
-                        dw_sum += nram_row[w_idx] * nram_dw[kh * K + kw];
+                        int w_idx_off = kw * dilation;
+                        dw_sum += nram_shared[w_idx_off] * dw[kh * K + kw];
                     }
                 } else {
                     for (int kw = 0; kw < K; kw++) {
@@ -89,24 +79,29 @@ __mlu_entry__ void depthwise_separable_conv2d_kernel(
                         float val = 0.0f;
                         if (h_idx >= 0 && h_idx < H &&
                             w_idx >= 0 && w_idx < W) {
-                            __memcpy(nram_row,
+                            __memcpy(nram_shared,
                                      x + plane_offset + h_idx * W + w_idx,
                                      sizeof(float), GDRAM2NRAM);
-                            val = nram_row[0];
+                            val = nram_shared[0];
                         }
-                        dw_sum += val * nram_dw[kh * K + kw];
+                        dw_sum += val * dw[kh * K + kw];
                     }
                 }
             }
-
-            sum += dw_sum * pw_val;
+            nram_shared[c] = dw_sum;
         }
 
-        nram_dw[0] = sum;
-        int out_offset = (b * out_c + oc) * out_spatial
-                         + h_out * W_out + w_out;
-        __memcpy(output + out_offset, nram_dw,
-                 sizeof(float), NRAM2GDRAM);
+        for (int oc = 0; oc < out_c; oc++) {
+            float sum = 0.0f;
+            float *pw_row = nram_pw + oc * in_c;
+            for (int c = 0; c < in_c; c++) {
+                sum += nram_shared[c] * pw_row[c];
+            }
+            int out_offset = (b * out_c + oc) * out_spatial
+                             + pos;
+            __memcpy(output + out_offset, &sum,
+                     sizeof(float), NRAM2GDRAM);
+        }
     }
 }
 
