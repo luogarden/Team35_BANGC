@@ -8,49 +8,41 @@ __mlu_func__ float fast_sqrt(float x) {
     if (x <= 0.0f) {
         return 0.0f;
     }
-    
-    // 基于 IEEE 754 的高精度初始估计
+
     union {
         float f;
         unsigned int i;
     } u;
     u.f = x;
-    
+
     int exp = ((u.i >> 23) & 0xFF) - 127;
     int new_exp = exp >> 1;
     int odd = exp & 1;
-    
-    // 保留尾数，设置新指数
+
     unsigned int mantissa = u.i & 0x007FFFFF;
     u.i = mantissa | ((new_exp + 127) << 23);
     float guess = u.f;
-    
-    // 奇数指数修正
+
     if (odd) {
         guess *= 1.4142135623730951f;
     }
-    
-    // 对尾数进行精细调整，使初始估计误差 < 2%
-    float m = mantissa / 8388608.0f;  // 尾数归一化到 [0, 1)
-    // sqrt(1 + m) 的线性近似：1 + 0.5*m - 0.125*m*(1-m) 
-    // 这是 sqrt(1+x) 在 x=0 处的二阶泰勒展开
+
+    float m = mantissa / 8388608.0f;
     float correction = 1.0f + 0.5f * m - 0.125f * m * (1.0f - m);
     guess *= correction;
-    
-    // 牛顿迭代 6 次，确保所有值收敛到 float 精度
+
+    // 若使用 float 计算，4 次牛顿迭代已足够
     guess = 0.5f * (guess + x / guess);
     guess = 0.5f * (guess + x / guess);
     guess = 0.5f * (guess + x / guess);
     guess = 0.5f * (guess + x / guess);
-    guess = 0.5f * (guess + x / guess);
-    guess = 0.5f * (guess + x / guess);
-    
+
     return guess;
 }
 
 __mlu_entry__ void sqrt_kernel(
-    float *input,
-    float *output,
+    half *input,
+    half *output,
     int total) {
 
     uint32_t core_id = taskId;
@@ -67,7 +59,7 @@ __mlu_entry__ void sqrt_kernel(
         per_core +
         (core_id < remainder ? 1 : 0);
 
-    __nram__ float buf[CHUNK_SIZE];
+    __nram__ half buf[CHUNK_SIZE];
 
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
 
@@ -79,52 +71,55 @@ __mlu_entry__ void sqrt_kernel(
         __memcpy(
             buf,
             input + start + offset,
-            len * sizeof(float),
+            len * sizeof(half),
             GDRAM2NRAM);
 
         for (uint32_t i = 0; i < len; i++) {
-            float val = buf[i];
-            val = val >= 0.0f ? val : -val;  // abs
-            buf[i] = fast_sqrt(val);
+            // 转为 float 做 abs + sqrt，再回写 half
+            float v = (float)buf[i];
+            if (v < 0.0f) v = -v;
+            float r = fast_sqrt(v);
+            buf[i] = (half)r;
         }
 
         __memcpy(
             output + start + offset,
             buf,
-            len * sizeof(float),
+            len * sizeof(half),
             NRAM2GDRAM);
     }
 }
 
-at::Tensor bang_func(at::Tensor input) {
+torch::Tensor bang_func(torch::Tensor x) {
 
-    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
 
-    auto x = input;
-    auto dtype = input.scalar_type();
+    auto original_dtype = x.scalar_type();
 
-    if (dtype != at::kFloat) {
-        x = input.to(at::kFloat);
+    torch::Tensor x_half = x;
+    if (original_dtype != torch::kHalf) {
+        x_half = x.to(torch::kHalf);
     }
 
-    auto out = at::empty_like(x);
-    int total = x.numel();
+    auto out_half = torch::empty_like(x_half);
+
+    int total = x_half.numel();
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    cnrtDim3_t dim = {4, 1, 1};
+    cnrtDim3_t dim = {16, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     sqrt_kernel<<<dim, ktype, queue>>>(
-        x.data_ptr<float>(),
-        out.data_ptr<float>(),
+        reinterpret_cast<half*>(x_half.data_ptr()),
+        reinterpret_cast<half*>(out_half.data_ptr()),
         total);
 
     cnrtQueueSync(queue);
 
-    if (dtype != at::kFloat) {
-        return out.to(dtype);
+    if (original_dtype != torch::kHalf) {
+        return out_half.to(original_dtype);
     }
 
-    return out;
+    return out_half;
 }
