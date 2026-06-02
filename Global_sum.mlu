@@ -1,0 +1,67 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_entry__ void global_sum_kernel(
+    float *input,
+    float *output,
+    int total) {
+
+    uint32_t core_id = taskId;
+
+    if (core_id != 0) {
+        return;
+    }
+
+    __nram__ float nram[CHUNK_SIZE];
+    float sum = 0.0f;
+
+    for (int offset = 0; offset < total; offset += CHUNK_SIZE) {
+        int len = (offset + CHUNK_SIZE <= total)
+                  ? CHUNK_SIZE : (total - offset);
+
+        __memcpy(nram, input + offset,
+                 len * sizeof(float), GDRAM2NRAM);
+
+        for (int i = 0; i < len; i++) {
+            sum += nram[i];
+        }
+    }
+
+    nram[0] = sum;
+    __memcpy(output, nram, sizeof(float), NRAM2GDRAM);
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x) {
+
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    int total = x_fp32.numel();
+    auto result = torch::empty({}, x_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    global_sum_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        result.data_ptr<float>(),
+        total);
+
+    if (original_dtype != torch::kFloat) {
+        result = result.to(original_dtype);
+    }
+
+    return result;
+}
