@@ -1,0 +1,177 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_entry__ void depthwise_separable_conv2d_kernel(
+    float *x,
+    float *dw_kernel,
+    float *pw_kernel,
+    float *output,
+    int batch,
+    int in_c,
+    int out_c,
+    int H,
+    int W,
+    int K,
+    int stride,
+    int padding,
+    int dilation,
+    int H_out,
+    int W_out) {
+
+    int spatial = H * W;
+    int out_spatial = H_out * W_out;
+    int total_out = batch * out_c * out_spatial;
+    int kernel_area = K * K;
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total_out / core_num;
+    uint32_t rem = total_out % core_num;
+    uint32_t start = core_id * per_core +
+                     (core_id < rem ? core_id : rem);
+    uint32_t count = per_core +
+                     (core_id < rem ? 1 : 0);
+
+    __nram__ float nram_dw[CHUNK_SIZE];
+    __nram__ float nram_pw[CHUNK_SIZE];
+    __nram__ float nram_row[CHUNK_SIZE];
+
+    for (uint32_t idx = 0; idx < count; idx++) {
+        uint32_t flat = start + idx;
+        int w_out = flat % W_out;
+        int tmp = flat / W_out;
+        int h_out = tmp % H_out;
+        int oc = (tmp / H_out) % out_c;
+        int b = tmp / H_out / out_c;
+
+        float sum = 0.0f;
+
+        for (int c = 0; c < in_c; c++) {
+
+            float pw_val = 1.0f;
+            if (in_c <= CHUNK_SIZE) {
+                __memcpy(nram_pw, pw_kernel + oc * in_c,
+                         in_c * sizeof(float), GDRAM2NRAM);
+                pw_val = nram_pw[c];
+            } else {
+                __memcpy(nram_pw, pw_kernel + oc * in_c + c,
+                         sizeof(float), GDRAM2NRAM);
+                pw_val = nram_pw[0];
+            }
+
+            __memcpy(nram_dw, dw_kernel + c * kernel_area,
+                     kernel_area * sizeof(float), GDRAM2NRAM);
+
+            int in_h_start = h_out * stride - padding;
+            int in_w_start = w_out * stride - padding;
+            int plane_offset = (b * in_c + c) * spatial;
+
+            float dw_sum = 0.0f;
+            for (int kh = 0; kh < K; kh++) {
+                int h_idx = in_h_start + kh * dilation;
+
+                if (h_idx >= 0 && h_idx < H &&
+                    in_w_start >= 0 && in_w_start + K * dilation <= W) {
+                    __memcpy(nram_row,
+                             x + plane_offset + h_idx * W + in_w_start,
+                             K * dilation * sizeof(float),
+                             GDRAM2NRAM);
+                    for (int kw = 0; kw < K; kw++) {
+                        int w_idx = kw * dilation;
+                        dw_sum += nram_row[w_idx] * nram_dw[kh * K + kw];
+                    }
+                } else {
+                    for (int kw = 0; kw < K; kw++) {
+                        int w_idx = in_w_start + kw * dilation;
+                        float val = 0.0f;
+                        if (h_idx >= 0 && h_idx < H &&
+                            w_idx >= 0 && w_idx < W) {
+                            __memcpy(nram_row,
+                                     x + plane_offset + h_idx * W + w_idx,
+                                     sizeof(float), GDRAM2NRAM);
+                            val = nram_row[0];
+                        }
+                        dw_sum += val * nram_dw[kh * K + kw];
+                    }
+                }
+            }
+
+            sum += dw_sum * pw_val;
+        }
+
+        nram_dw[0] = sum;
+        int out_offset = (b * out_c + oc) * out_spatial
+                         + h_out * W_out + w_out;
+        __memcpy(output + out_offset, nram_dw,
+                 sizeof(float), NRAM2GDRAM);
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor depthwise_kernel,
+    torch::Tensor pointwise_kernel,
+    int in_channels,
+    int out_channels,
+    int kernel_size,
+    int stride,
+    int padding,
+    int dilation) {
+
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(depthwise_kernel.is_contiguous(), "depthwise kernel must be contiguous");
+    TORCH_CHECK(pointwise_kernel.is_contiguous(), "pointwise kernel must be contiguous");
+    TORCH_CHECK(x.dim() == 4, "x must be 4D");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    torch::Tensor dw_fp32 = depthwise_kernel;
+    torch::Tensor pw_fp32 = pointwise_kernel;
+
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+    if (depthwise_kernel.scalar_type() != torch::kFloat) {
+        dw_fp32 = depthwise_kernel.to(torch::kFloat);
+    }
+    if (pointwise_kernel.scalar_type() != torch::kFloat) {
+        pw_fp32 = pointwise_kernel.to(torch::kFloat);
+    }
+
+    int batch = (int)x_fp32.size(0);
+    int H = (int)x_fp32.size(2);
+    int W = (int)x_fp32.size(3);
+    int K = kernel_size;
+
+    int H_out = (H + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
+    int W_out = (W + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
+
+    auto output_fp32 = torch::empty(
+        {(int64_t)batch, (int64_t)out_channels,
+         (int64_t)H_out, (int64_t)W_out},
+        x_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    depthwise_separable_conv2d_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        dw_fp32.data_ptr<float>(),
+        pw_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch, in_channels, out_channels, H, W,
+        K, stride, padding, dilation,
+        H_out, W_out);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
