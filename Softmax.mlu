@@ -1,0 +1,138 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_func__ float fast_exp(float x) {
+    if (x < -87.3f) {
+        return 0.0f;
+    }
+
+    const float inv_ln2 = 1.44269504088896341f;
+    const float ln2_hi = 0.693359375f;
+    const float ln2_lo = -0.00021217204052209854f;
+
+    float kf = x * inv_ln2;
+    int k = (int)(kf + (kf >= 0.0f ? 0.5f : -0.5f));
+    float r = x - (float)k * ln2_hi - (float)k * ln2_lo;
+
+    float p = 1.0f + r * (1.0f + r * (0.5f +
+              r * (0.16666667163372039795f +
+              r * (0.04166668280959129333f +
+              r * (0.00833333097338676453f +
+              r * (0.00138889296869188547f +
+              r * (0.00019841069537773788f +
+              r * 0.000024793375991914592f)))))));
+
+    union {
+        float f;
+        unsigned int u;
+    } result;
+    result.u = (unsigned int)(k + 127) << 23;
+    return p * result.f;
+}
+
+__mlu_entry__ void softmax_kernel(
+    float *input,
+    float *output,
+    int batch,
+    int dim) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = batch / core_num;
+    uint32_t rem = batch % core_num;
+    uint32_t row_start = core_id * per_core +
+                         (core_id < rem ? core_id : rem);
+    uint32_t row_count = per_core +
+                         (core_id < rem ? 1 : 0);
+
+    __nram__ float nram[CHUNK_SIZE];
+
+    for (uint32_t r = 0; r < row_count; r++) {
+        int row = row_start + r;
+        float *row_ptr = input + row * dim;
+
+        float max_val = -3.4028234663852886e38f;
+        for (int start = 0; start < dim; start += CHUNK_SIZE) {
+            int len = (start + CHUNK_SIZE <= dim)
+                      ? CHUNK_SIZE : (dim - start);
+
+            __memcpy(nram, row_ptr + start,
+                     len * sizeof(float), GDRAM2NRAM);
+
+            for (int i = 0; i < len; i++) {
+                if (nram[i] > max_val) {
+                    max_val = nram[i];
+                }
+            }
+        }
+
+        float sum_exp = 0.0f;
+        for (int start = 0; start < dim; start += CHUNK_SIZE) {
+            int len = (start + CHUNK_SIZE <= dim)
+                      ? CHUNK_SIZE : (dim - start);
+
+            __memcpy(nram, row_ptr + start,
+                     len * sizeof(float), GDRAM2NRAM);
+
+            for (int i = 0; i < len; i++) {
+                float e = fast_exp(nram[i] - max_val);
+                nram[i] = e;
+                sum_exp += e;
+            }
+        }
+
+        float inv_sum = 1.0f / sum_exp;
+
+        for (int start = 0; start < dim; start += CHUNK_SIZE) {
+            int len = (start + CHUNK_SIZE <= dim)
+                      ? CHUNK_SIZE : (dim - start);
+
+            __memcpy(nram, row_ptr + start,
+                     len * sizeof(float), GDRAM2NRAM);
+
+            for (int i = 0; i < len; i++) {
+                nram[i] = fast_exp(nram[i] - max_val) * inv_sum;
+            }
+
+            __memcpy(output + row * dim + start,
+                     nram, len * sizeof(float), NRAM2GDRAM);
+        }
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x) {
+
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 2, "x must be a 2D tensor");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    int batch = (int)x_fp32.size(0);
+    int dim = (int)x_fp32.size(1);
+    auto output_fp32 = torch::empty_like(x_fp32);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch_dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    softmax_kernel<<<launch_dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch, dim);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
