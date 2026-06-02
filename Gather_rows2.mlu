@@ -1,0 +1,155 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_entry__ void gather_kernel(
+    float *x,
+    int *indices,
+    int *bin_ids,
+    float *weights,
+    int *bins,
+    float *output,
+    int tokens,
+    int hidden_size,
+    int num_elements,
+    int top_k,
+    bool has_weights) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+
+    uint32_t per_core = num_elements / core_num;
+    uint32_t remainder = num_elements % core_num;
+
+    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
+
+    __nram__ float x_buf[CHUNK_SIZE];
+    __nram__ float w_buf[CHUNK_SIZE];
+    __nram__ float out_buf[CHUNK_SIZE];
+
+    for (uint32_t i = 0; i < count; ++i) {
+        int pid = start + i;
+
+        int bin_id = bin_ids[pid];
+        int bin_start = (bin_id == 0) ? 0 : bins[bin_id - 1];
+        int offset_in_bin = pid - bin_start;
+        int index_b = offset_in_bin + bin_start;
+
+        int src_row = indices[pid] / top_k;
+
+        float scale = 1.0f;
+        if (has_weights) {
+            scale = weights[indices[pid]];
+        }
+
+        int out_row = index_b;
+        int x_offset = src_row * hidden_size;
+        int out_offset = out_row * hidden_size;
+
+        for (int j = 0; j < hidden_size; j += CHUNK_SIZE) {
+            int len = (j + CHUNK_SIZE <= hidden_size) ? CHUNK_SIZE : (hidden_size - j);
+
+            __memcpy(
+                x_buf,
+                x + x_offset + j,
+                len * sizeof(float),
+                GDRAM2NRAM
+            );
+
+            for (int k = 0; k < len; ++k) {
+                out_buf[k] = x_buf[k] * scale;
+            }
+
+            __memcpy(
+                output + out_offset + j,
+                out_buf,
+                len * sizeof(float),
+                NRAM2GDRAM
+            );
+        }
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor indices,
+    torch::Tensor bin_ids,
+    torch::Tensor weights,
+    torch::Tensor bins,
+    int64_t top_k) {
+
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
+    TORCH_CHECK(bin_ids.is_contiguous(), "bin_ids must be contiguous");
+    TORCH_CHECK(bins.is_contiguous(), "bins must be contiguous");
+
+    auto x_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    if (x_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    torch::Tensor indices_int32 = indices;
+    if (indices.scalar_type() != torch::kInt) {
+        indices_int32 = indices.to(torch::kInt);
+    }
+
+    torch::Tensor bin_ids_int32 = bin_ids;
+    if (bin_ids.scalar_type() != torch::kInt) {
+        bin_ids_int32 = bin_ids.to(torch::kInt);
+    }
+
+    torch::Tensor bins_int32 = bins;
+    if (bins.scalar_type() != torch::kInt) {
+        bins_int32 = bins.to(torch::kInt);
+    }
+
+    bool has_weights = weights.defined() && weights.numel() > 0;
+
+    torch::Tensor weights_fp32;
+    if (has_weights) {
+        TORCH_CHECK(weights.is_contiguous(), "weights must be contiguous");
+        weights_fp32 = weights;
+        if (weights.scalar_type() != torch::kFloat) {
+            weights_fp32 = weights.to(torch::kFloat);
+        }
+    }
+
+    int tokens = x_fp32.size(0);
+    int hidden_size = x_fp32.size(1);
+    int num_elements = indices_int32.numel();
+
+    auto output_fp32 = torch::zeros(
+        {tokens * top_k, hidden_size},
+        x_fp32.options()
+    );
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    gather_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        indices_int32.data_ptr<int>(),
+        bin_ids_int32.data_ptr<int>(),
+        has_weights ? weights_fp32.data_ptr<float>() : nullptr,
+        bins_int32.data_ptr<int>(),
+        output_fp32.data_ptr<float>(),
+        tokens,
+        hidden_size,
+        num_elements,
+        static_cast<int>(top_k),
+        has_weights
+    );
+
+    if (x_dtype != torch::kFloat) {
+        return output_fp32.to(x_dtype);
+    }
+
+    return output_fp32;
+}
