@@ -21,9 +21,8 @@ __mlu_entry__ void masked_fill_kernel(
     uint32_t count = per_core +
                      (core_id < remainder ? 1 : 0);
 
-    __nram__ half nram_a[CHUNK_SIZE];
-    __nram__ half nram_b[CHUNK_SIZE];
-    __nram__ half nram_c[CHUNK_SIZE];
+    __nram__ half nram_x[CHUNK_SIZE];
+    __nram__ half nram_m[CHUNK_SIZE];
 
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
 
@@ -32,28 +31,18 @@ __mlu_entry__ void masked_fill_kernel(
                 ? CHUNK_SIZE
                 : (count - offset);
 
-        uint32_t aligned_len = (len + 63) & ~63;
-
-        __memcpy(nram_a, x + start + offset,
+        __memcpy(nram_x, x + start + offset,
                  len * sizeof(half), GDRAM2NRAM);
-        __memcpy(nram_b, mask + start + offset,
+        __memcpy(nram_m, mask + start + offset,
                  len * sizeof(half), GDRAM2NRAM);
 
-        for (uint32_t i = len; i < aligned_len; i++) {
-            nram_a[i] = (half)0.0f;
-            nram_b[i] = (half)0.0f;
+        for (uint32_t i = 0; i < len; i++) {
+            if (nram_m[i] != (half)0.0f) {
+                nram_x[i] = fill_value;
+            }
         }
 
-        __bang_mul(nram_c, nram_a, nram_b, aligned_len);
-
-        __bang_sub(nram_a, nram_a, nram_c, aligned_len);
-
-        __bang_mul_scalar(nram_b, nram_b,
-                          fill_value, aligned_len);
-
-        __bang_add(nram_a, nram_a, nram_b, aligned_len);
-
-        __memcpy(output + start + offset, nram_a,
+        __memcpy(output + start + offset, nram_x,
                  len * sizeof(half), NRAM2GDRAM);
     }
 }
