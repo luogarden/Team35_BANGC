@@ -1,0 +1,119 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_entry__ void l1norm_kernel(
+    float *input,
+    float *output,
+    int batch,
+    int dim) {
+
+    int rows = batch;
+    int row_stride = dim;
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = rows / core_num;
+    uint32_t rem = rows % core_num;
+    uint32_t row_start = core_id * per_core +
+                         (core_id < rem ? core_id : rem);
+    uint32_t row_count = per_core +
+                         (core_id < rem ? 1 : 0);
+
+    __nram__ float nram[CHUNK_SIZE];
+
+    for (uint32_t r = 0; r < row_count; r++) {
+        int row = row_start + r;
+        float *row_ptr = input + row * row_stride;
+
+        float norm = 0.0f;
+        for (int start = 0; start < dim; start += CHUNK_SIZE) {
+            int len = (start + CHUNK_SIZE <= dim)
+                      ? CHUNK_SIZE : (dim - start);
+            int aligned_len = (len + 63) & ~63;
+
+            __memcpy(nram, row_ptr + start,
+                     len * sizeof(float), GDRAM2NRAM);
+
+            for (int i = len; i < aligned_len; i++) {
+                nram[i] = 0.0f;
+            }
+
+            for (int i = 0; i < aligned_len; i++) {
+                if (nram[i] < 0.0f) {
+                    nram[i] = -nram[i];
+                }
+            }
+
+            norm += __bang_sum(nram, aligned_len);
+        }
+
+        if (norm == 0.0f) {
+            norm = 1.0f;
+        }
+
+        float inv_norm = 1.0f / norm;
+
+        for (int start = 0; start < dim; start += CHUNK_SIZE) {
+            int len = (start + CHUNK_SIZE <= dim)
+                      ? CHUNK_SIZE : (dim - start);
+            int aligned_len = (len + 63) & ~63;
+
+            __memcpy(nram, row_ptr + start,
+                     len * sizeof(float), GDRAM2NRAM);
+
+            for (int i = len; i < aligned_len; i++) {
+                nram[i] = 0.0f;
+            }
+
+            __bang_mul_scalar(nram, nram, inv_norm, aligned_len);
+
+            __memcpy(output + row * row_stride + start,
+                     nram, len * sizeof(float), NRAM2GDRAM);
+        }
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x) {
+
+    TORCH_CHECK(
+        x.is_contiguous(),
+        "Input must be contiguous");
+    TORCH_CHECK(x.dim() == 2, "Input must be a 2D tensor");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    int batch = (int)x_fp32.size(0);
+    int dim = (int)x_fp32.size(1);
+
+    auto output_fp32 = torch::empty_like(x_fp32);
+
+    cnrtQueue_t queue =
+        torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t launch_dim = {4, 1, 1};
+    cnrtFunctionType_t ktype =
+        cnrtFuncTypeUnion1;
+
+    l1norm_kernel<<<launch_dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch,
+        dim
+    );
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
