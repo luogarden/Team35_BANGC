@@ -1,8 +1,6 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include <stdint.h>
-#include <vector>
 
 #define M_TILE 32
 #define K_TILE 512
