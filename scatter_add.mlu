@@ -1,0 +1,96 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_entry__ void scatter_add_kernel(
+    float *src,
+    int32_t *index,
+    float *out,
+    int N,
+    int D,
+    int dim_size) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+
+    uint32_t per_core = N / core_num;
+    uint32_t remainder = N % core_num;
+
+    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
+
+    __nram__ float src_buf[CHUNK_SIZE];
+
+    for (uint32_t i = 0; i < count; ++i) {
+        int row = start + i;
+        int dst_row = index[row];
+        if (dst_row < 0 || dst_row >= dim_size) {
+            continue;
+        }
+
+        int src_offset = row * D;
+        int dst_offset = dst_row * D;
+
+        for (int j = 0; j < D; j += CHUNK_SIZE) {
+            int len = (j + CHUNK_SIZE <= D) ? CHUNK_SIZE : (D - j);
+
+            __memcpy(
+                src_buf,
+                src + src_offset + j,
+                len * sizeof(float),
+                GDRAM2NRAM
+            );
+
+            for (int k = 0; k < len; ++k) {
+                out[dst_offset + j + k] += src_buf[k];
+            }
+        }
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor src,
+    torch::Tensor index,
+    int dim_size) {
+
+    TORCH_CHECK(src.is_contiguous(), "src must be contiguous");
+    TORCH_CHECK(index.is_contiguous(), "index must be contiguous");
+
+    auto src_dtype = src.scalar_type();
+
+    torch::Tensor src_fp32 = src;
+    if (src_dtype != torch::kFloat) {
+        src_fp32 = src.to(torch::kFloat);
+    }
+
+    torch::Tensor index_i32 = index;
+    if (index.scalar_type() != torch::kInt32) {
+        index_i32 = index.to(torch::kInt32);
+    }
+
+    int N = src_fp32.size(0);
+    int D = src_fp32.size(1);
+
+    auto out_fp32 = torch::zeros({dim_size, D}, src_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    scatter_add_kernel<<<dim, ktype, queue>>>(
+        src_fp32.data_ptr<float>(),
+        index_i32.data_ptr<int32_t>(),
+        out_fp32.data_ptr<float>(),
+        N,
+        D,
+        dim_size
+    );
+
+    if (src_dtype != torch::kFloat) {
+        return out_fp32.to(src_dtype);
+    }
+    return out_fp32;
+}
