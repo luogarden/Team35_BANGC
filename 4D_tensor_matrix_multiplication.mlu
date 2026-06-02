@@ -2,8 +2,9 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define M_TILE 16
+#define M_TILE 32
 #define K_TILE 128
+#define L_BLOCK 32
 #define TASK_NUM 32
 
 __mlu_entry__ void tensor4d_matmul_kernel(
@@ -19,10 +20,11 @@ __mlu_entry__ void tensor4d_matmul_kernel(
     int total_tiles = row_tiles * col_tiles;
 
     __nram__ float accum[M_TILE * K_TILE];
+    __nram__ float a_block[M_TILE * L_BLOCK];
+    __nram__ float b_block[L_BLOCK * K_TILE];
+    __nram__ float prod[M_TILE * K_TILE];
     __nram__ float a_mat[M_TILE * K_TILE];
     __nram__ float b_mat[M_TILE * K_TILE];
-    __nram__ float prod[M_TILE * K_TILE];
-    __nram__ float b_vec[K_TILE];
 
     for (int tile = taskId; tile < total_tiles; tile += taskDim) {
         int row_tile = tile / col_tiles;
@@ -34,23 +36,36 @@ __mlu_entry__ void tensor4d_matmul_kernel(
 
         __bang_write_value(accum, M_TILE * K_TILE, 0.0f);
 
-        for (int ll = 0; ll < L; ++ll) {
-            __memcpy(b_vec,
-                     B + ll * K + col_start,
-                     k_size * sizeof(float),
-                     GDRAM2NRAM);
+        for (int l_block = 0; l_block < L; l_block += L_BLOCK) {
+            int actual_lb = (l_block + L_BLOCK <= L) ? L_BLOCK : (L - l_block);
 
-            for (int row = 0; row < m_size; ++row) {
-                float a_val = A[(row_start + row) * L + ll];
-                __bang_write_value(a_mat + row * K_TILE, k_size, a_val);
-                __memcpy(b_mat + row * K_TILE,
-                         b_vec,
+            for (int li = 0; li < actual_lb; ++li) {
+                __memcpy(b_block + li * K_TILE,
+                         B + (l_block + li) * K + col_start,
                          k_size * sizeof(float),
-                         NRAM2NRAM);
+                         GDRAM2NRAM);
             }
 
-            __bang_mul(prod, a_mat, b_mat, M_TILE * K_TILE);
-            __bang_add(accum, accum, prod, M_TILE * K_TILE);
+            for (int row = 0; row < m_size; ++row) {
+                __memcpy(a_block + row * L_BLOCK,
+                         A + (row_start + row) * L + l_block,
+                         actual_lb * sizeof(float),
+                         GDRAM2NRAM);
+            }
+
+            for (int li = 0; li < actual_lb; ++li) {
+                for (int row = 0; row < m_size; ++row) {
+                    float a_val = a_block[row * L_BLOCK + li];
+                    __bang_write_value(a_mat + row * K_TILE, k_size, a_val);
+                    __memcpy(b_mat + row * K_TILE,
+                             b_block + li * K_TILE,
+                             k_size * sizeof(float),
+                             NRAM2NRAM);
+                }
+
+                __bang_mul(prod, a_mat, b_mat, M_TILE * K_TILE);
+                __bang_add(accum, accum, prod, M_TILE * K_TILE);
+            }
         }
 
         for (int row = 0; row < m_size; ++row) {
