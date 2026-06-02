@@ -32,15 +32,15 @@ __mlu_entry__ void max_reduction_kernel(
         int base = b * dim1 * dim2 + d2;
 
         for (int d1 = 0; d1 < dim1; d1++) {
-            float val;
-            __memcpy(&val, input + base + d1 * dim2,
+            __memcpy(nram, input + base + d1 * dim2,
                      sizeof(float), GDRAM2NRAM);
-            if (val > max_val) {
-                max_val = val;
+            if (nram[0] > max_val) {
+                max_val = nram[0];
             }
         }
 
-        __memcpy(output + flat, &max_val,
+        nram[0] = max_val;
+        __memcpy(output + flat, nram,
                  sizeof(float), NRAM2GDRAM);
     }
 }
