@@ -10,13 +10,10 @@ __mlu_entry__ void l1norm_kernel(
     int batch,
     int dim) {
 
-    int rows = batch;
-    int row_stride = dim;
-
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
-    uint32_t per_core = rows / core_num;
-    uint32_t rem = rows % core_num;
+    uint32_t per_core = batch / core_num;
+    uint32_t rem = batch % core_num;
     uint32_t row_start = core_id * per_core +
                          (core_id < rem ? core_id : rem);
     uint32_t row_count = per_core +
@@ -26,7 +23,7 @@ __mlu_entry__ void l1norm_kernel(
 
     for (uint32_t r = 0; r < row_count; r++) {
         int row = row_start + r;
-        float *row_ptr = input + row * row_stride;
+        float *row_ptr = input + row * dim;
 
         float norm = 0.0f;
         for (int start = 0; start < dim; start += CHUNK_SIZE) {
@@ -41,13 +38,11 @@ __mlu_entry__ void l1norm_kernel(
                 nram[i] = 0.0f;
             }
 
-            for (int i = 0; i < aligned_len; i++) {
-                if (nram[i] < 0.0f) {
-                    nram[i] = -nram[i];
-                }
+            for (int i = 0; i < len; i++) {
+                float v = nram[i];
+                if (v < 0.0f) v = -v;
+                norm += v;
             }
-
-            norm += __bang_sum(nram, aligned_len);
         }
 
         if (norm == 0.0f) {
@@ -70,7 +65,7 @@ __mlu_entry__ void l1norm_kernel(
 
             __bang_mul_scalar(nram, nram, inv_norm, aligned_len);
 
-            __memcpy(output + row * row_stride + start,
+            __memcpy(output + row * dim + start,
                      nram, len * sizeof(float), NRAM2GDRAM);
         }
     }
@@ -80,10 +75,8 @@ __mlu_entry__ void l1norm_kernel(
 torch::Tensor bang_func(
     torch::Tensor x) {
 
-    TORCH_CHECK(
-        x.is_contiguous(),
-        "Input must be contiguous");
-    TORCH_CHECK(x.dim() == 2, "Input must be a 2D tensor");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 2, "x must be a 2D tensor");
 
     auto original_dtype = x.scalar_type();
 
@@ -94,22 +87,16 @@ torch::Tensor bang_func(
 
     int batch = (int)x_fp32.size(0);
     int dim = (int)x_fp32.size(1);
-
     auto output_fp32 = torch::empty_like(x_fp32);
 
-    cnrtQueue_t queue =
-        torch_mlu::getCurMLUStream();
-
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t launch_dim = {4, 1, 1};
-    cnrtFunctionType_t ktype =
-        cnrtFuncTypeUnion1;
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     l1norm_kernel<<<launch_dim, ktype, queue>>>(
         x_fp32.data_ptr<float>(),
         output_fp32.data_ptr<float>(),
-        batch,
-        dim
-    );
+        batch, dim);
 
     if (original_dtype != torch::kFloat) {
         return output_fp32.to(original_dtype);
