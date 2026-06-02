@@ -6,10 +6,10 @@
 
 __mlu_entry__ void gather_kernel(
     float *x,
-    int *indices,
-    int *bin_ids,
+    int32_t *indices,
+    int32_t *bin_ids,
     float *weights,
-    int *bins,
+    int32_t *bins,
     float *output,
     int tokens,
     int hidden_size,
@@ -80,7 +80,7 @@ torch::Tensor bang_func(
     torch::Tensor bin_ids,
     torch::Tensor weights,
     torch::Tensor bins,
-    int64_t top_k) {
+    int top_k) {
 
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
@@ -95,18 +95,18 @@ torch::Tensor bang_func(
     }
 
     torch::Tensor indices_int32 = indices;
-    if (indices.scalar_type() != torch::kInt) {
-        indices_int32 = indices.to(torch::kInt);
+    if (indices.scalar_type() != torch::kInt32) {
+        indices_int32 = indices.to(torch::kInt32);
     }
 
     torch::Tensor bin_ids_int32 = bin_ids;
-    if (bin_ids.scalar_type() != torch::kInt) {
-        bin_ids_int32 = bin_ids.to(torch::kInt);
+    if (bin_ids.scalar_type() != torch::kInt32) {
+        bin_ids_int32 = bin_ids.to(torch::kInt32);
     }
 
     torch::Tensor bins_int32 = bins;
-    if (bins.scalar_type() != torch::kInt) {
-        bins_int32 = bins.to(torch::kInt);
+    if (bins.scalar_type() != torch::kInt32) {
+        bins_int32 = bins.to(torch::kInt32);
     }
 
     bool has_weights = weights.defined() && weights.numel() > 0;
@@ -135,10 +135,10 @@ torch::Tensor bang_func(
 
     gather_kernel<<<dim, ktype, queue>>>(
         x_fp32.data_ptr<float>(),
-        indices_int32.data_ptr<int>(),
-        bin_ids_int32.data_ptr<int>(),
+        indices_int32.data_ptr<int32_t>(),
+        bin_ids_int32.data_ptr<int32_t>(),
         has_weights ? weights_fp32.data_ptr<float>() : nullptr,
-        bins_int32.data_ptr<int>(),
+        bins_int32.data_ptr<int32_t>(),
         output_fp32.data_ptr<float>(),
         tokens,
         hidden_size,
