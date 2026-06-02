@@ -4,28 +4,6 @@
 
 #define CHUNK_SIZE 4096
 
-__mlu_func__ float fast_sqrt(float x) {
-    if (x <= 0.0f) return 0.0f;
-
-    union { float f; unsigned int i; } u;
-    u.f = x;
-    int exp = ((u.i >> 23) & 0xFF) - 127;
-    int new_exp = exp >> 1;
-
-    u.i = (u.i & 0x007FFFFF) | ((new_exp + 127) << 23);
-    float guess = u.f;
-    if (exp & 1) guess *= 1.4142135623730951f;
-
-    float m = (u.i & 0x007FFFFF) / 8388608.0f;
-    guess *= 1.0f + 0.5f * m - 0.125f * m * (1.0f - m);
-
-    guess = 0.5f * (guess + x / guess);
-    guess = 0.5f * (guess + x / guess);
-    guess = 0.5f * (guess + x / guess);
-    guess = 0.5f * (guess + x / guess);
-    return guess;
-}
-
 __mlu_entry__ void l2norm_kernel(
     float *input,
     float *output,
@@ -46,7 +24,6 @@ __mlu_entry__ void l2norm_kernel(
     for (uint32_t r = 0; r < row_count; r++) {
         int row = row_start + r;
         float *row_ptr = input + row * dim;
-        float *out_ptr = output + row * dim;
 
         float sum_sq = 0.0f;
         for (int start = 0; start < dim; start += CHUNK_SIZE) {
@@ -57,15 +34,21 @@ __mlu_entry__ void l2norm_kernel(
             __memcpy(nram, row_ptr + start,
                      len * sizeof(float), GDRAM2NRAM);
 
-            for (int i = len; i < aligned_len; i++)
+            for (int i = len; i < aligned_len; i++) {
                 nram[i] = 0.0f;
+            }
 
-            __bang_mul(nram, nram, nram, aligned_len);
-            sum_sq += __bang_sum(nram, aligned_len);
+            for (int i = 0; i < len; i++) {
+                float v = nram[i];
+                sum_sq += v * v;
+            }
         }
 
-        float norm = fast_sqrt(sum_sq);
-        if (norm == 0.0f) norm = 1.0f;
+        float norm = sqrtf(sum_sq);
+        if (norm == 0.0f) {
+            norm = 1.0f;
+        }
+
         float inv_norm = 1.0f / norm;
 
         for (int start = 0; start < dim; start += CHUNK_SIZE) {
@@ -76,13 +59,14 @@ __mlu_entry__ void l2norm_kernel(
             __memcpy(nram, row_ptr + start,
                      len * sizeof(float), GDRAM2NRAM);
 
-            for (int i = len; i < aligned_len; i++)
+            for (int i = len; i < aligned_len; i++) {
                 nram[i] = 0.0f;
+            }
 
             __bang_mul_scalar(nram, nram, inv_norm, aligned_len);
 
-            __memcpy(out_ptr + start, nram,
-                     len * sizeof(float), NRAM2GDRAM);
+            __memcpy(output + row * dim + start,
+                     nram, len * sizeof(float), NRAM2GDRAM);
         }
     }
 }
@@ -97,24 +81,26 @@ torch::Tensor bang_func(
     auto original_dtype = x.scalar_type();
 
     torch::Tensor x_fp32 = x;
-    if (original_dtype != torch::kFloat)
+    if (original_dtype != torch::kFloat) {
         x_fp32 = x.to(torch::kFloat);
+    }
 
     int batch = (int)x_fp32.size(0);
     int dim = (int)x_fp32.size(1);
     auto output_fp32 = torch::empty_like(x_fp32);
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t launch_dim = {16, 1, 1};
-    cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_BLOCK;
+    cnrtDim3_t launch_dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     l2norm_kernel<<<launch_dim, ktype, queue>>>(
         x_fp32.data_ptr<float>(),
         output_fp32.data_ptr<float>(),
         batch, dim);
 
-    if (original_dtype != torch::kFloat)
+    if (original_dtype != torch::kFloat) {
         return output_fp32.to(original_dtype);
+    }
 
     return output_fp32;
 }
