@@ -2,7 +2,7 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CHUNK_SIZE 4096
+#define ROW_BUF 2048
 
 __mlu_entry__ void depthwise_separable_conv2d_kernel(
     float *x,
@@ -26,15 +26,8 @@ __mlu_entry__ void depthwise_separable_conv2d_kernel(
     int total_positions = batch * out_spatial;
     int kernel_area = K * K;
 
-    int total_dw = in_c * kernel_area;
-    int total_pw = out_c * in_c;
-
-    __nram__ float nram_dw[CHUNK_SIZE];
-    __nram__ float nram_pw[CHUNK_SIZE];
-    __nram__ float nram_shared[CHUNK_SIZE];
-
-    __memcpy(nram_dw, dw_kernel, total_dw * sizeof(float), GDRAM2NRAM);
-    __memcpy(nram_pw, pw_kernel, total_pw * sizeof(float), GDRAM2NRAM);
+    __nram__ float nram_kern[ROW_BUF];
+    __nram__ float nram_io[ROW_BUF];
 
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
@@ -56,8 +49,10 @@ __mlu_entry__ void depthwise_separable_conv2d_kernel(
         int in_w_start = w_out * stride - padding;
 
         for (int c = 0; c < in_c; c++) {
+            __memcpy(nram_kern, dw_kernel + c * kernel_area,
+                     kernel_area * sizeof(float), GDRAM2NRAM);
+
             int plane_offset = (int)(b * in_c + c) * spatial;
-            float *dw = nram_dw + c * kernel_area;
             float dw_sum = 0.0f;
 
             for (int kh = 0; kh < K; kh++) {
@@ -65,13 +60,13 @@ __mlu_entry__ void depthwise_separable_conv2d_kernel(
 
                 if (h_idx >= 0 && h_idx < H &&
                     in_w_start >= 0 && in_w_start + K * dilation <= W) {
-                    __memcpy(nram_shared,
+                    __memcpy(nram_io,
                              x + plane_offset + h_idx * W + in_w_start,
                              K * dilation * sizeof(float),
                              GDRAM2NRAM);
                     for (int kw = 0; kw < K; kw++) {
-                        int w_idx_off = kw * dilation;
-                        dw_sum += nram_shared[w_idx_off] * dw[kh * K + kw];
+                        dw_sum += nram_io[kw * dilation] *
+                                  nram_kern[kh * K + kw];
                     }
                 } else {
                     for (int kw = 0; kw < K; kw++) {
@@ -79,26 +74,27 @@ __mlu_entry__ void depthwise_separable_conv2d_kernel(
                         float val = 0.0f;
                         if (h_idx >= 0 && h_idx < H &&
                             w_idx >= 0 && w_idx < W) {
-                            __memcpy(nram_shared,
+                            __memcpy(nram_io + 1,
                                      x + plane_offset + h_idx * W + w_idx,
                                      sizeof(float), GDRAM2NRAM);
-                            val = nram_shared[0];
+                            val = nram_io[1];
                         }
-                        dw_sum += val * dw[kh * K + kw];
+                        dw_sum += val * nram_kern[kh * K + kw];
                     }
                 }
             }
-            nram_shared[c] = dw_sum;
+            nram_io[c] = dw_sum;
         }
 
         for (int oc = 0; oc < out_c; oc++) {
+            __memcpy(nram_kern, pw_kernel + oc * in_c,
+                     in_c * sizeof(float), GDRAM2NRAM);
+
             float sum = 0.0f;
-            float *pw_row = nram_pw + oc * in_c;
             for (int c = 0; c < in_c; c++) {
-                sum += nram_shared[c] * pw_row[c];
+                sum += nram_io[c] * nram_kern[c];
             }
-            int out_offset = (b * out_c + oc) * out_spatial
-                             + pos;
+            int out_offset = (b * out_c + oc) * out_spatial + pos;
             __memcpy(output + out_offset, &sum,
                      sizeof(float), NRAM2GDRAM);
         }
