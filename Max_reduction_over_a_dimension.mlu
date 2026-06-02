@@ -1,0 +1,85 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_entry__ void max_reduction_kernel(
+    float *input,
+    float *output,
+    int batch,
+    int dim1,
+    int dim2) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    int total_out = batch * dim2;
+    uint32_t per_core = total_out / core_num;
+    uint32_t rem = total_out % core_num;
+    uint32_t start = core_id * per_core +
+                     (core_id < rem ? core_id : rem);
+    uint32_t count = per_core +
+                     (core_id < rem ? 1 : 0);
+
+    __nram__ float nram[CHUNK_SIZE];
+
+    for (uint32_t idx = 0; idx < count; idx++) {
+        int flat = start + idx;
+        int d2 = flat % dim2;
+        int b = flat / dim2;
+
+        float max_val = -3.4028234663852886e38f;
+        int base = b * dim1 * dim2 + d2;
+
+        for (int d1 = 0; d1 < dim1; d1++) {
+            float val;
+            __memcpy(&val, input + base + d1 * dim2,
+                     sizeof(float), GDRAM2NRAM);
+            if (val > max_val) {
+                max_val = val;
+            }
+        }
+
+        __memcpy(output + flat, &max_val,
+                 sizeof(float), NRAM2GDRAM);
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    int dim) {
+
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 3, "x must be a 3D tensor");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    int batch = (int)x_fp32.size(0);
+    int dim1 = (int)x_fp32.size(1);
+    int dim2 = (int)x_fp32.size(2);
+
+    auto output_fp32 = torch::empty(
+        {(int64_t)batch, (int64_t)dim2},
+        x_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch_dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    max_reduction_kernel<<<launch_dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch, dim1, dim2);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
