@@ -2,7 +2,7 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CHUNK_SIZE 4096
+#define CHUNK_SIZE 8192
 
 __mlu_func__ float fast_exp(float x) {
     if (x < -87.3f) {
@@ -53,6 +53,7 @@ __mlu_entry__ void softmax_kernel(
     for (uint32_t r = 0; r < row_count; r++) {
         int row = row_start + r;
         float *row_ptr = input + row * dim;
+        float *out_ptr = output + row * dim;
 
         float max_val = -3.4028234663852886e38f;
         for (int start = 0; start < dim; start += CHUNK_SIZE) {
@@ -63,9 +64,7 @@ __mlu_entry__ void softmax_kernel(
                      len * sizeof(float), GDRAM2NRAM);
 
             for (int i = 0; i < len; i++) {
-                if (nram[i] > max_val) {
-                    max_val = nram[i];
-                }
+                if (nram[i] > max_val) max_val = nram[i];
             }
         }
 
@@ -82,6 +81,9 @@ __mlu_entry__ void softmax_kernel(
                 nram[i] = e;
                 sum_exp += e;
             }
+
+            __memcpy(out_ptr + start, nram,
+                     len * sizeof(float), NRAM2GDRAM);
         }
 
         float inv_sum = 1.0f / sum_exp;
@@ -89,16 +91,19 @@ __mlu_entry__ void softmax_kernel(
         for (int start = 0; start < dim; start += CHUNK_SIZE) {
             int len = (start + CHUNK_SIZE <= dim)
                       ? CHUNK_SIZE : (dim - start);
+            int aligned_len = (len + 63) & ~63;
 
-            __memcpy(nram, row_ptr + start,
+            __memcpy(nram, out_ptr + start,
                      len * sizeof(float), GDRAM2NRAM);
 
-            for (int i = 0; i < len; i++) {
-                nram[i] = fast_exp(nram[i] - max_val) * inv_sum;
+            for (int i = len; i < aligned_len; i++) {
+                nram[i] = 0.0f;
             }
 
-            __memcpy(output + row * dim + start,
-                     nram, len * sizeof(float), NRAM2GDRAM);
+            __bang_mul_scalar(nram, nram, inv_sum, aligned_len);
+
+            __memcpy(out_ptr + start, nram,
+                     len * sizeof(float), NRAM2GDRAM);
         }
     }
 }
@@ -122,8 +127,8 @@ torch::Tensor bang_func(
     auto output_fp32 = torch::empty_like(x_fp32);
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t launch_dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    cnrtDim3_t launch_dim = {16, 1, 1};
+    cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_BLOCK;
 
     softmax_kernel<<<launch_dim, ktype, queue>>>(
         x_fp32.data_ptr<float>(),
