@@ -1,0 +1,69 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <math.h>
+#include <torch/extension.h>
+#include "torch_mlu/csrc/core/MLUStream.h"
+
+#define FROBENIUS_NORM_EPS 1.0e-12f
+
+__mlu_global__ void frobenius_sum_squares_kernel(const float *x,
+                                                  float *partial_sums,
+                                                  int numel) {
+  const int tid = taskId;
+  const int stride = taskDim;
+  float sum = 0.0f;
+
+  for (int i = tid; i < numel; i += stride) {
+    const float value = x[i];
+    sum += value * value;
+  }
+
+  partial_sums[tid] = sum;
+}
+
+__mlu_global__ void frobenius_normalize_kernel(const float *x,
+                                                const float *partial_sums,
+                                                float *out,
+                                                int numel,
+                                                int partial_count) {
+  float sum = 0.0f;
+
+  for (int i = 0; i < partial_count; ++i) {
+    sum += partial_sums[i];
+  }
+
+  const float inv_norm = 1.0f / sqrtf(sum + FROBENIUS_NORM_EPS);
+
+  for (int i = taskId; i < numel; i += taskDim) {
+    out[i] = x[i] * inv_norm;
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor x) {
+  TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be float32");
+  TORCH_CHECK(x.numel() > 0, "x must be non-empty");
+
+  x = x.contiguous();
+
+  const int numel = x.numel();
+  auto out = torch::empty_like(x);
+  const int task_count = 16;
+  auto partial_sums = torch::empty({task_count}, x.options());
+
+  auto queue = torch_mlu::getCurrentMLUStream().queue();
+  const cnrtDim3_t task_dim = {task_count, 1, 1};
+  const cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_BLOCK;
+
+  frobenius_sum_squares_kernel<<<task_dim, ktype, queue>>>(
+      x.data_ptr<float>(),
+      partial_sums.data_ptr<float>(),
+      numel);
+  frobenius_normalize_kernel<<<task_dim, ktype, queue>>>(
+      x.data_ptr<float>(),
+      partial_sums.data_ptr<float>(),
+      out.data_ptr<float>(),
+      numel,
+      task_count);
+
+  return out;
+}

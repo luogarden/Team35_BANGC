@@ -1,0 +1,77 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <math.h>
+#include <torch/extension.h>
+#include "torch_mlu/csrc/core/MLUStream.h"
+
+#define COSINE_LOSS_EPS 1.0e-8f
+
+__mlu_global__ void cosine_similarity_loss_forward_kernel(const float *predictions,
+                                                           const float *targets,
+                                                           float *sample_losses,
+                                                           int batch_size,
+                                                           int feature_dim) {
+  for (int row = taskId; row < batch_size; row += taskDim) {
+    const int base = row * feature_dim;
+    float dot = 0.0f;
+    float pred_norm_sq = 0.0f;
+    float target_norm_sq = 0.0f;
+
+    for (int col = 0; col < feature_dim; ++col) {
+      const float pred = predictions[base + col];
+      const float target = targets[base + col];
+      dot += pred * target;
+      pred_norm_sq += pred * pred;
+      target_norm_sq += target * target;
+    }
+
+    const float denom = sqrtf(pred_norm_sq) * sqrtf(target_norm_sq) + COSINE_LOSS_EPS;
+    sample_losses[row] = 1.0f - dot / denom;
+  }
+}
+
+__mlu_global__ void cosine_similarity_loss_mean_kernel(const float *sample_losses,
+                                                        float *loss,
+                                                        int batch_size) {
+  float sum = 0.0f;
+
+  for (int i = 0; i < batch_size; ++i) {
+    sum += sample_losses[i];
+  }
+
+  *loss = sum / (float)batch_size;
+}
+
+torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
+  TORCH_CHECK(predictions.dim() == 2, "predictions must be a 2D tensor");
+  TORCH_CHECK(targets.dim() == 2, "targets must be a 2D tensor");
+  TORCH_CHECK(predictions.sizes() == targets.sizes(), "predictions and targets must have the same shape");
+  TORCH_CHECK(predictions.scalar_type() == torch::kFloat32, "predictions must be float32");
+  TORCH_CHECK(targets.scalar_type() == torch::kFloat32, "targets must be float32");
+
+  predictions = predictions.contiguous();
+  targets = targets.contiguous();
+
+  const int batch_size = predictions.size(0);
+  const int feature_dim = predictions.size(1);
+  auto sample_losses = torch::empty({batch_size}, predictions.options());
+  auto loss = torch::empty({}, predictions.options());
+
+  auto queue = torch_mlu::getCurrentMLUStream().queue();
+  const cnrtDim3_t compute_dim = {16, 1, 1};
+  const cnrtDim3_t reduce_dim = {1, 1, 1};
+  const cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_BLOCK;
+
+  cosine_similarity_loss_forward_kernel<<<compute_dim, ktype, queue>>>(
+      predictions.data_ptr<float>(),
+      targets.data_ptr<float>(),
+      sample_losses.data_ptr<float>(),
+      batch_size,
+      feature_dim);
+  cosine_similarity_loss_mean_kernel<<<reduce_dim, ktype, queue>>>(
+      sample_losses.data_ptr<float>(),
+      loss.data_ptr<float>(),
+      batch_size);
+
+  return loss;
+}

@@ -1,0 +1,77 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <math.h>
+#include <torch/extension.h>
+#include "torch_mlu/csrc/core/MLUStream.h"
+
+__mlu_global__ void cross_entropy_loss_forward_kernel(const float *predictions,
+                                                       const int64_t *targets,
+                                                       float *sample_losses,
+                                                       int batch_size,
+                                                       int num_classes) {
+  for (int row = taskId; row < batch_size; row += taskDim) {
+    const int base = row * num_classes;
+    float max_logit = predictions[base];
+
+    for (int col = 1; col < num_classes; ++col) {
+      const float logit = predictions[base + col];
+      if (logit > max_logit) {
+        max_logit = logit;
+      }
+    }
+
+    float exp_sum = 0.0f;
+    for (int col = 0; col < num_classes; ++col) {
+      exp_sum += expf(predictions[base + col] - max_logit);
+    }
+
+    const int64_t target = targets[row];
+    sample_losses[row] = logf(exp_sum) + max_logit - predictions[base + target];
+  }
+}
+
+__mlu_global__ void cross_entropy_loss_mean_kernel(const float *sample_losses,
+                                                    float *loss,
+                                                    int batch_size) {
+  float sum = 0.0f;
+
+  for (int i = 0; i < batch_size; ++i) {
+    sum += sample_losses[i];
+  }
+
+  *loss = sum / (float)batch_size;
+}
+
+torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
+  TORCH_CHECK(predictions.dim() == 2, "predictions must be a 2D tensor");
+  TORCH_CHECK(targets.dim() == 1, "targets must be a 1D tensor");
+  TORCH_CHECK(predictions.size(0) == targets.size(0), "batch sizes must match");
+  TORCH_CHECK(predictions.scalar_type() == torch::kFloat32, "predictions must be float32");
+  TORCH_CHECK(targets.scalar_type() == torch::kInt64, "targets must be int64");
+
+  predictions = predictions.contiguous();
+  targets = targets.contiguous();
+
+  const int batch_size = predictions.size(0);
+  const int num_classes = predictions.size(1);
+  auto sample_losses = torch::empty({batch_size}, predictions.options());
+  auto loss = torch::empty({}, predictions.options());
+
+  auto queue = torch_mlu::getCurrentMLUStream().queue();
+  const cnrtDim3_t compute_dim = {16, 1, 1};
+  const cnrtDim3_t reduce_dim = {1, 1, 1};
+  const cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_BLOCK;
+
+  cross_entropy_loss_forward_kernel<<<compute_dim, ktype, queue>>>(
+      predictions.data_ptr<float>(),
+      targets.data_ptr<int64_t>(),
+      sample_losses.data_ptr<float>(),
+      batch_size,
+      num_classes);
+  cross_entropy_loss_mean_kernel<<<reduce_dim, ktype, queue>>>(
+      sample_losses.data_ptr<float>(),
+      loss.data_ptr<float>(),
+      batch_size);
+
+  return loss;
+}

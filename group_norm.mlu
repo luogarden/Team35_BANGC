@@ -1,0 +1,80 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <math.h>
+#include <torch/extension.h>
+#include "torch_mlu/csrc/core/MLUStream.h"
+
+#define GROUP_NORM_EPS 1.0e-5f
+
+__mlu_global__ void group_norm_forward_kernel(const float *x,
+                                               float *out,
+                                               int batch,
+                                               int num_features,
+                                               int height,
+                                               int width,
+                                               int num_groups) {
+  const int groups_per_batch = num_groups;
+  const int total_groups = batch * groups_per_batch;
+  const int channels_per_group = num_features / num_groups;
+  const int spatial_size = height * width;
+  const int group_size = channels_per_group * spatial_size;
+
+  for (int group_index = taskId; group_index < total_groups; group_index += taskDim) {
+    const int n = group_index / num_groups;
+    const int g = group_index % num_groups;
+    const int c_start = g * channels_per_group;
+
+    float sum = 0.0f;
+    float square_sum = 0.0f;
+
+    for (int i = 0; i < group_size; ++i) {
+      const int c_offset = i / spatial_size;
+      const int hw = i % spatial_size;
+      const int offset = ((n * num_features + c_start + c_offset) * height * width) + hw;
+      const float value = x[offset];
+      sum += value;
+      square_sum += value * value;
+    }
+
+    const float mean = sum / (float)group_size;
+    const float variance = square_sum / (float)group_size - mean * mean;
+    const float inv_std = 1.0f / sqrtf(variance + GROUP_NORM_EPS);
+
+    for (int i = 0; i < group_size; ++i) {
+      const int c_offset = i / spatial_size;
+      const int hw = i % spatial_size;
+      const int offset = ((n * num_features + c_start + c_offset) * height * width) + hw;
+      out[offset] = (x[offset] - mean) * inv_std;
+    }
+  }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int num_groups, int num_features) {
+  TORCH_CHECK(x.dim() == 4, "x must be a 4D tensor");
+  TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be float32");
+  TORCH_CHECK(x.size(1) == num_features, "num_features must match x.size(1)");
+  TORCH_CHECK(num_groups > 0, "num_groups must be positive");
+  TORCH_CHECK(num_features % num_groups == 0, "num_features must be divisible by num_groups");
+
+  x = x.contiguous();
+
+  const int batch = x.size(0);
+  const int height = x.size(2);
+  const int width = x.size(3);
+  auto out = torch::empty_like(x);
+
+  auto queue = torch_mlu::getCurrentMLUStream().queue();
+  const cnrtDim3_t task_dim = {16, 1, 1};
+  const cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_BLOCK;
+
+  group_norm_forward_kernel<<<task_dim, ktype, queue>>>(
+      x.data_ptr<float>(),
+      out.data_ptr<float>(),
+      batch,
+      (int)num_features,
+      height,
+      width,
+      (int)num_groups);
+
+  return out;
+}
