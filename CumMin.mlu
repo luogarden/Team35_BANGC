@@ -1,0 +1,84 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_entry__ void cummin_kernel(
+    float *input,
+    float *output,
+    int batch,
+    int length) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = batch / core_num;
+    uint32_t rem = batch % core_num;
+    uint32_t row_start = core_id * per_core +
+                         (core_id < rem ? core_id : rem);
+    uint32_t row_count = per_core +
+                         (core_id < rem ? 1 : 0);
+
+    __nram__ float nram[CHUNK_SIZE];
+
+    for (uint32_t r = 0; r < row_count; r++) {
+        int row = row_start + r;
+        float *row_in = input + row * length;
+        float *row_out = output + row * length;
+
+        float running_min = 3.4028234663852886e38f;
+
+        for (int start = 0; start < length; start += CHUNK_SIZE) {
+            int len = (start + CHUNK_SIZE <= length)
+                      ? CHUNK_SIZE : (length - start);
+
+            __memcpy(nram, row_in + start,
+                     len * sizeof(float), GDRAM2NRAM);
+
+            for (int i = 0; i < len; i++) {
+                if (nram[i] < running_min) {
+                    running_min = nram[i];
+                }
+                nram[i] = running_min;
+            }
+
+            __memcpy(row_out + start, nram,
+                     len * sizeof(float), NRAM2GDRAM);
+        }
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    int dim) {
+
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 2, "x must be a 2D tensor");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    int batch = (int)x_fp32.size(0);
+    int length = (int)x_fp32.size(1);
+    auto output_fp32 = torch::empty_like(x_fp32);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch_dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    cummin_kernel<<<launch_dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch, length);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}

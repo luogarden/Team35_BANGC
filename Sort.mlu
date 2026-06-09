@@ -1,0 +1,88 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_entry__ void sort_kernel(
+    float *input,
+    float *output,
+    int batch,
+    int dim,
+    int descending) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = batch / core_num;
+    uint32_t rem = batch % core_num;
+    uint32_t row_start = core_id * per_core +
+                         (core_id < rem ? core_id : rem);
+    uint32_t row_count = per_core +
+                         (core_id < rem ? 1 : 0);
+
+    __nram__ float nram[CHUNK_SIZE];
+
+    for (uint32_t r = 0; r < row_count; r++) {
+        int row = row_start + r;
+
+        __memcpy(nram, input + row * dim,
+                 dim * sizeof(float), GDRAM2NRAM);
+
+        for (int i = 0; i < dim - 1; i++) {
+            int best = i;
+            for (int j = i + 1; j < dim; j++) {
+                if (descending) {
+                    if (nram[j] > nram[best]) best = j;
+                } else {
+                    if (nram[j] < nram[best]) best = j;
+                }
+            }
+            if (best != i) {
+                float tmp = nram[i];
+                nram[i] = nram[best];
+                nram[best] = tmp;
+            }
+        }
+
+        __memcpy(output + row * dim, nram,
+                 dim * sizeof(float), NRAM2GDRAM);
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    int dim,
+    bool descending) {
+
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 2, "x must be a 2D tensor");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    int batch = (int)x_fp32.size(0);
+    int d = (int)x_fp32.size(1);
+
+    auto output_fp32 = torch::empty_like(x_fp32);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch_dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    sort_kernel<<<launch_dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch, d,
+        descending ? 1 : 0);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}

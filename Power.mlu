@@ -1,0 +1,145 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_func__ float fast_log(float x) {
+    union {
+        float f;
+        unsigned int u;
+    } value;
+    value.f = x;
+    int e = (int)((value.u >> 23) & 0xff) - 127;
+    value.u = (value.u & 0x007fffff) | 0x3f800000;
+    float m = value.f;
+    if (m > 1.4142135623730951f) {
+        m *= 0.5f;
+        e += 1;
+    }
+    float y = (m - 1.0f) / (m + 1.0f);
+    float y2 = y * y;
+    float poly = y + y2 * y * 0.3333333333333333f
+                 + y2 * y2 * y * 0.2f
+                 + y2 * y2 * y2 * y * 0.14285714285714285f
+                 + y2 * y2 * y2 * y2 * y * 0.1111111111111111f;
+    return 2.0f * poly + (float)e * 0.6931471805599453f;
+}
+
+__mlu_func__ float fast_exp(float x) {
+    if (x < -87.3f) return 0.0f;
+
+    const float inv_ln2 = 1.44269504088896341f;
+    const float ln2_hi = 0.693359375f;
+    const float ln2_lo = -0.00021217204052209854f;
+
+    float kf = x * inv_ln2;
+    int k = (int)(kf + (kf >= 0.0f ? 0.5f : -0.5f));
+    float r = x - (float)k * ln2_hi - (float)k * ln2_lo;
+
+    float p = 1.0f + r * (1.0f + r * (0.5f +
+              r * (0.16666667163372039795f +
+              r * (0.04166668280959129333f +
+              r * (0.00833333097338676453f +
+              r * (0.00138889296869188547f +
+              r * (0.00019841069537773788f +
+              r * 0.000024793375991914592f)))))));
+
+    union { float f; unsigned int u; } res;
+    res.u = (unsigned int)(k + 127) << 23;
+    return p * res.f;
+}
+
+__mlu_entry__ void power_kernel(
+    float *input,
+    float *output,
+    float exponent,
+    int total) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total / core_num;
+    uint32_t remainder = total % core_num;
+
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
+
+    __nram__ float nram[CHUNK_SIZE];
+
+    int is_int_exp = (exponent == (int)exponent);
+    int int_exp = (int)exponent;
+
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
+        uint32_t len = (offset + CHUNK_SIZE <= count)
+                       ? CHUNK_SIZE : (count - offset);
+
+        __memcpy(nram, input + start + offset,
+                 len * sizeof(float), GDRAM2NRAM);
+
+        if (is_int_exp && int_exp == 2) {
+            for (uint32_t i = 0; i < len; i++) {
+                float x = nram[i];
+                if (x < 0.0f) x = -x;
+                nram[i] = x * x;
+            }
+        } else if (is_int_exp) {
+            for (uint32_t i = 0; i < len; i++) {
+                float x = nram[i];
+                if (x < 0.0f) x = -x;
+                float result = 1.0f;
+                int p = int_exp;
+                while (p > 0) {
+                    if (p & 1) result *= x;
+                    x *= x;
+                    p >>= 1;
+                }
+                nram[i] = result;
+            }
+        } else {
+            for (uint32_t i = 0; i < len; i++) {
+                float x = nram[i];
+                if (x < 0.0f) x = -x;
+                nram[i] = fast_exp(exponent * fast_log(x));
+            }
+        }
+
+        __memcpy(output + start + offset, nram,
+                 len * sizeof(float), NRAM2GDRAM);
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    double exponent) {
+
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    auto output_fp32 = torch::empty_like(x_fp32);
+    int total = x_fp32.numel();
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    power_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        (float)exponent,
+        total);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
