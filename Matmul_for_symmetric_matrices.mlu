@@ -8,8 +8,8 @@
 #define TASK_NUM 32
 
 __mlu_entry__ void sym_matmul_kernel(
-    const float *A,
-    const float *B,
+    float *A,
+    float *B,
     float *C,
     int N) {
 
@@ -19,7 +19,7 @@ __mlu_entry__ void sym_matmul_kernel(
 
     __nram__ float accum[M_TILE * N_TILE];
     __nram__ float a_block[M_TILE * K_BLOCK];
-    __wram__ float b_block[K_BLOCK * N_TILE];
+    __nram__ float b_block[K_BLOCK * N_TILE];
 
     for (int tile = taskId; tile < total_tiles; tile += taskDim) {
         int row_tile = tile / col_tiles;
@@ -38,10 +38,7 @@ __mlu_entry__ void sym_matmul_kernel(
                 __memcpy(b_block + ki * N_TILE,
                          B + (k_block + ki) * N + col_start,
                          n_size * sizeof(float),
-                         GDRAM2WRAM);
-            }
-            for (int ki = actual_kb; ki < K_BLOCK; ++ki) {
-                __bang_write_value(b_block + ki * N_TILE, N_TILE, 0.0f);
+                         GDRAM2NRAM);
             }
 
             for (int row = 0; row < m_size; ++row) {
@@ -49,16 +46,18 @@ __mlu_entry__ void sym_matmul_kernel(
                          A + (row_start + row) * N + k_block,
                          actual_kb * sizeof(float),
                          GDRAM2NRAM);
-                for (int ki = actual_kb; ki < K_BLOCK; ++ki) {
-                    a_block[row * K_BLOCK + ki] = 0.0f;
-                }
-            }
-            for (int row = m_size; row < M_TILE; ++row) {
-                __bang_write_value(a_block + row * K_BLOCK, K_BLOCK, 0.0f);
             }
 
-            __bang_matmul(accum, a_block, b_block, accum,
-                          M_TILE, K_BLOCK, N_TILE);
+            for (int ki = 0; ki < actual_kb; ++ki) {
+                for (int row = 0; row < m_size; ++row) {
+                    int base = row * N_TILE;
+                    float a_val = a_block[row * K_BLOCK + ki];
+                    float *b_row = b_block + ki * N_TILE;
+                    for (int col = 0; col < n_size; ++col) {
+                        accum[base + col] += a_val * b_row[col];
+                    }
+                }
+            }
         }
 
         for (int row = 0; row < m_size; ++row) {
