@@ -1,0 +1,99 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+#define TASK_NUM 16
+
+__mlu_entry__ void irregular_matmul_kernel(
+    float *A,
+    float *B,
+    float *output,
+    int M,
+    int K,
+    int N) {
+
+    int total = M * N;
+    __nram__ float nram_a[CHUNK_SIZE];
+    __nram__ float nram_b[CHUNK_SIZE];
+    __nram__ float nram_prod[CHUNK_SIZE];
+
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        int col = idx % N;
+        int row = idx / N;
+
+        float sum = 0.0f;
+        for (int start = 0; start < K; start += CHUNK_SIZE) {
+            int len = (start + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - start);
+            int aligned_len = (len + 63) & ~63;
+
+            __memcpy(nram_a, A + row * K + start,
+                     len * sizeof(float), GDRAM2NRAM);
+
+            for (int kk = 0; kk < len; kk++) {
+                __memcpy(nram_b + kk,
+                         B + (start + kk) * N + col,
+                         sizeof(float), GDRAM2NRAM);
+            }
+
+            for (int i = len; i < aligned_len; ++i) {
+                nram_a[i] = 0.0f;
+                nram_b[i] = 0.0f;
+            }
+
+            __bang_mul(nram_prod, nram_a, nram_b, aligned_len);
+
+            for (int i = 0; i < aligned_len; i++) {
+                sum += nram_prod[i];
+            }
+        }
+
+        nram_prod[0] = sum;
+        __memcpy(output + idx, nram_prod, sizeof(float), NRAM2GDRAM);
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor A,
+    torch::Tensor B) {
+
+    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
+    TORCH_CHECK(A.dim() == 2, "A must be a 2D tensor");
+    TORCH_CHECK(B.dim() == 2, "B must be a 2D tensor");
+    TORCH_CHECK(A.size(1) == B.size(0), "A.size(1) must equal B.size(0)");
+
+    auto original_dtype = A.scalar_type();
+
+    torch::Tensor A_fp32 = A;
+    torch::Tensor B_fp32 = B;
+    if (original_dtype != torch::kFloat) {
+        A_fp32 = A.to(torch::kFloat);
+    }
+    if (B.scalar_type() != torch::kFloat) {
+        B_fp32 = B.to(torch::kFloat);
+    }
+
+    int M = (int)A_fp32.size(0);
+    int K = (int)A_fp32.size(1);
+    int N = (int)B_fp32.size(1);
+    auto output_fp32 = torch::empty({(int64_t)M, (int64_t)N},
+                                    A_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {TASK_NUM, 1, 1};
+    cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_BLOCK;
+
+    irregular_matmul_kernel<<<dim, ktype, queue>>>(
+        A_fp32.data_ptr<float>(),
+        B_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        M, K, N);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
