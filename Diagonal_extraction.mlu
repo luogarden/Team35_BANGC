@@ -1,0 +1,79 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+__mlu_entry__ void diagonal_kernel(
+    float *A,
+    float *output,
+    int batch,
+    int N,
+    int offset,
+    int diag_len) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = batch / core_num;
+    uint32_t rem = batch % core_num;
+    uint32_t start = core_id * per_core +
+                     (core_id < rem ? core_id : rem);
+    uint32_t count = per_core +
+                     (core_id < rem ? 1 : 0);
+
+    __nram__ float nram[1];
+    int row_start = offset < 0 ? -offset : 0;
+    int col_start = offset > 0 ? offset : 0;
+
+    for (uint32_t b = 0; b < count; b++) {
+        int bidx = start + b;
+        float *mat = A + bidx * N * N;
+
+        for (int i = 0; i < diag_len; i++) {
+            int r = row_start + i;
+            int c = col_start + i;
+            __memcpy(nram, mat + r * N + c,
+                     sizeof(float), GDRAM2NRAM);
+            __memcpy(output + bidx * diag_len + i, nram,
+                     sizeof(float), NRAM2GDRAM);
+        }
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor A,
+    int offset) {
+
+    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+    TORCH_CHECK(A.dim() == 3, "A must be a 3D tensor");
+
+    auto original_dtype = A.scalar_type();
+
+    torch::Tensor A_fp32 = A;
+    if (original_dtype != torch::kFloat) {
+        A_fp32 = A.to(torch::kFloat);
+    }
+
+    int batch = (int)A_fp32.size(0);
+    int N = (int)A_fp32.size(1);
+    int abs_off = offset < 0 ? -offset : offset;
+    int diag_len = N - abs_off;
+
+    auto output_fp32 = torch::empty(
+        {(int64_t)batch, (int64_t)diag_len},
+        A_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    diagonal_kernel<<<dim, ktype, queue>>>(
+        A_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch, N, offset, diag_len);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
