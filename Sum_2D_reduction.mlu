@@ -1,0 +1,84 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_entry__ void sum2d_reduction_kernel(
+    float *input,
+    float *output,
+    int batch,
+    int H,
+    int W) {
+
+    int plane_size = H * W;
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = batch / core_num;
+    uint32_t rem = batch % core_num;
+    uint32_t start = core_id * per_core +
+                     (core_id < rem ? core_id : rem);
+    uint32_t count = per_core +
+                     (core_id < rem ? 1 : 0);
+
+    __nram__ float nram[CHUNK_SIZE];
+
+    for (uint32_t b = 0; b < count; b++) {
+        int batch_idx = start + b;
+        float *plane = input + batch_idx * plane_size;
+        float sum = 0.0f;
+
+        for (int offset = 0; offset < plane_size; offset += CHUNK_SIZE) {
+            int len = (offset + CHUNK_SIZE <= plane_size)
+                      ? CHUNK_SIZE : (plane_size - offset);
+
+            __memcpy(nram, plane + offset,
+                     len * sizeof(float), GDRAM2NRAM);
+
+            for (int i = 0; i < len; i++) {
+                sum += nram[i];
+            }
+        }
+
+        nram[0] = sum;
+        __memcpy(output + batch_idx, nram,
+                 sizeof(float), NRAM2GDRAM);
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x) {
+
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 3, "x must be a 3D tensor");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    int batch = (int)x_fp32.size(0);
+    int H = (int)x_fp32.size(1);
+    int W = (int)x_fp32.size(2);
+
+    auto output_fp32 = torch::empty({(int64_t)batch},
+                                    x_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t launch_dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    sum2d_reduction_kernel<<<launch_dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch, H, W);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
