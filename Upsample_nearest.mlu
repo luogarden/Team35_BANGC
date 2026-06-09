@@ -1,0 +1,101 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define MAX_W 128
+#define MAX_WO (MAX_W * 2)
+
+__mlu_entry__ void upsample_nearest_kernel(
+    float *input,
+    float *output,
+    int batch,
+    int C,
+    int H,
+    int W,
+    int scale) {
+
+    int H_out = H * scale;
+    int W_out = W * scale;
+    int total_out_rows = batch * C * H_out;
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total_out_rows / core_num;
+    uint32_t rem = total_out_rows % core_num;
+    uint32_t start = core_id * per_core +
+                     (core_id < rem ? core_id : rem);
+    uint32_t count = per_core +
+                     (core_id < rem ? 1 : 0);
+
+    __nram__ float nram_in[MAX_W];
+    __nram__ float nram_out[MAX_WO];
+
+    for (uint32_t idx = 0; idx < count; idx++) {
+        int flat = start + idx;
+        int h_out = flat % H_out;
+        int meta = flat / H_out;
+        int c = meta % C;
+        int b = meta / C;
+
+        int h_in = h_out / scale;
+
+        int in_plane = (b * C + c) * H * W;
+        int out_plane = (b * C + c) * H_out * W_out;
+
+        __memcpy(nram_in, input + in_plane + h_in * W,
+                 W * sizeof(float), GDRAM2NRAM);
+
+        for (int w = 0; w < W; w++) {
+            for (int sc = 0; sc < scale; sc++) {
+                nram_out[w * scale + sc] = nram_in[w];
+            }
+        }
+
+        __memcpy(output + out_plane + h_out * W_out, nram_out,
+                 W_out * sizeof(float), NRAM2GDRAM);
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    int scale_factor) {
+
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 4, "x must be a 4D tensor");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    int batch = (int)x_fp32.size(0);
+    int C = (int)x_fp32.size(1);
+    int H = (int)x_fp32.size(2);
+    int W = (int)x_fp32.size(3);
+    int scale = scale_factor;
+    int H_out = H * scale;
+    int W_out = W * scale;
+
+    auto output_fp32 = torch::empty(
+        {(int64_t)batch, (int64_t)C,
+         (int64_t)H_out, (int64_t)W_out},
+        x_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {16, 1, 1};
+    cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_BLOCK;
+
+    upsample_nearest_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch, C, H, W, scale);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}

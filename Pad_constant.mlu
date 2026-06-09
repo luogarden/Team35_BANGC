@@ -1,0 +1,115 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <vector>
+
+#define CHUNK_SIZE 4096
+
+__mlu_entry__ void pad_constant_kernel(
+    float *input,
+    float *output,
+    float fill_value,
+    int N,
+    int C,
+    int H,
+    int W,
+    int pad_left,
+    int pad_right,
+    int pad_top,
+    int pad_bottom,
+    int H_out,
+    int W_out) {
+
+    int total = N * C * H_out * W_out;
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total / core_num;
+    uint32_t rem = total % core_num;
+    uint32_t start = core_id * per_core +
+                     (core_id < rem ? core_id : rem);
+    uint32_t count = per_core +
+                     (core_id < rem ? 1 : 0);
+
+    int in_spatial = H * W;
+    int out_spatial = H_out * W_out;
+
+    __nram__ float nram[CHUNK_SIZE];
+
+    for (uint32_t idx = 0; idx < count; idx++) {
+        int flat = start + idx;
+        int w = flat % W_out;
+        int tmp = flat / W_out;
+        int h = tmp % H_out;
+        tmp /= H_out;
+        int c = tmp % C;
+        int n = tmp / C;
+
+        int h_in = h - pad_top;
+        int w_in = w - pad_left;
+
+        if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {
+            __memcpy(nram, input + ((n * C + c) * H + h_in) * W + w_in,
+                     sizeof(float), GDRAM2NRAM);
+        } else {
+            nram[0] = fill_value;
+        }
+
+        __memcpy(output + (n * C + c) * out_spatial
+                 + h * W_out + w, nram,
+                 sizeof(float), NRAM2GDRAM);
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    std::vector<int64_t> pad,
+    double value) {
+
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 4, "x must be a 4D tensor");
+    TORCH_CHECK(pad.size() == 4, "pad must have 4 elements");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    int N = (int)x_fp32.size(0);
+    int C = (int)x_fp32.size(1);
+    int H = (int)x_fp32.size(2);
+    int W = (int)x_fp32.size(3);
+
+    int pad_left = (int)pad[0];
+    int pad_right = (int)pad[1];
+    int pad_top = (int)pad[2];
+    int pad_bottom = (int)pad[3];
+
+    int H_out = H + pad_top + pad_bottom;
+    int W_out = W + pad_left + pad_right;
+
+    auto output_fp32 = torch::empty(
+        {(int64_t)N, (int64_t)C,
+         (int64_t)H_out, (int64_t)W_out},
+        x_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    pad_constant_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        (float)value,
+        N, C, H, W,
+        pad_left, pad_right, pad_top, pad_bottom,
+        H_out, W_out);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}

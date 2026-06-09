@@ -1,0 +1,93 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_entry__ void where_kernel(
+    float *condition,
+    float *x,
+    float *y,
+    float *output,
+    int total) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total / core_num;
+    uint32_t rem = total % core_num;
+    uint32_t start = core_id * per_core +
+                     (core_id < rem ? core_id : rem);
+    uint32_t count = per_core +
+                     (core_id < rem ? 1 : 0);
+
+    __nram__ float nram_c[CHUNK_SIZE];
+    __nram__ float nram_x[CHUNK_SIZE];
+    __nram__ float nram_y[CHUNK_SIZE];
+
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
+        uint32_t len = (offset + CHUNK_SIZE <= count)
+                       ? CHUNK_SIZE : (count - offset);
+        int idx = start + offset;
+
+        __memcpy(nram_c, condition + idx,
+                 len * sizeof(float), GDRAM2NRAM);
+        __memcpy(nram_x, x + idx,
+                 len * sizeof(float), GDRAM2NRAM);
+        __memcpy(nram_y, y + idx,
+                 len * sizeof(float), GDRAM2NRAM);
+
+        for (uint32_t i = 0; i < len; i++) {
+            nram_c[i] = (nram_c[i] != 0.0f) ? nram_x[i] : nram_y[i];
+        }
+
+        __memcpy(output + idx, nram_c,
+                 len * sizeof(float), NRAM2GDRAM);
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor condition,
+    torch::Tensor x,
+    torch::Tensor y) {
+
+    TORCH_CHECK(condition.is_contiguous(), "condition must be contiguous");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(y.is_contiguous(), "y must be contiguous");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    torch::Tensor y_fp32 = y;
+    torch::Tensor c_fp32 = condition;
+
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+    if (y.scalar_type() != torch::kFloat) {
+        y_fp32 = y.to(torch::kFloat);
+    }
+    if (c_fp32.scalar_type() != torch::kFloat) {
+        c_fp32 = condition.to(torch::kFloat);
+    }
+
+    auto output_fp32 = torch::empty_like(x_fp32);
+    int total = x_fp32.numel();
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    where_kernel<<<dim, ktype, queue>>>(
+        c_fp32.data_ptr<float>(),
+        x_fp32.data_ptr<float>(),
+        y_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        total);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}

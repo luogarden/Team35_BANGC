@@ -1,0 +1,66 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define MAX_CLASSES 1024
+
+__mlu_entry__ void onehot_kernel(
+    int64_t *input,
+    float *output,
+    int batch,
+    int num_classes) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = batch / core_num;
+    uint32_t rem = batch % core_num;
+    uint32_t start = core_id * per_core +
+                     (core_id < rem ? core_id : rem);
+    uint32_t count = per_core +
+                     (core_id < rem ? 1 : 0);
+
+    __nram__ int64_t nram_idx[1];
+    __nram__ float nram_row[MAX_CLASSES];
+
+    for (uint32_t i = 0; i < count; i++) {
+        int row = start + i;
+
+        __memcpy(nram_idx, input + row,
+                 sizeof(int64_t), GDRAM2NRAM);
+
+        __bang_write_value(nram_row, num_classes, 0.0f);
+        nram_row[(int)nram_idx[0]] = 1.0f;
+
+        __memcpy(output + row * num_classes, nram_row,
+                 num_classes * sizeof(float), NRAM2GDRAM);
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    int num_classes) {
+
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 1, "x must be a 1D tensor");
+
+    int batch = (int)x.size(0);
+    auto output = torch::empty({(int64_t)batch, (int64_t)num_classes},
+                               torch::kFloat);
+
+    auto x_long = x;
+    if (x_long.scalar_type() != torch::kLong) {
+        x_long = x.to(torch::kLong);
+    }
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    onehot_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<int64_t*>(x_long.data_ptr()),
+        output.data_ptr<float>(),
+        batch, num_classes);
+
+    return output;
+}
