@@ -1,0 +1,102 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_func__ float fast_cos(float x) {
+    float ax = x >= 0.0f ? x : -x;
+
+    const float inv_pi2 = 0.6366197466850281f;
+    const float pi2_hi  = 1.5707962512969971f;
+    const float pi2_lo  = 7.549789415861596e-08f;
+
+    float nf = ax * inv_pi2;
+    int n = (int)(nf + 0.5f);
+
+    float r = ax - (float)n * pi2_hi;
+    r = r - (float)n * pi2_lo;
+
+    float r2 = r * r;
+    float sin_r = r * (1.0f + r2 * (-0.1666666716337204f +
+                      r2 * ( 0.00833333283603191f +
+                      r2 * (-0.0001984144890366797f +
+                      r2 * ( 0.00000275263578004264f +
+                      r2 * (-0.00000002392976470819f))))));
+    float cos_r = 1.0f + r2 * (-0.5f +
+                      r2 * ( 0.0416666679084301f +
+                      r2 * (-0.00138888892251998f +
+                      r2 * ( 0.0000248015872938269f +
+                      r2 * (-0.0000002755733546676f)))));
+
+    int q = n & 3;
+    if (q == 0)      return  cos_r;
+    else if (q == 1) return -sin_r;
+    else if (q == 2) return -cos_r;
+    else             return  sin_r;
+}
+
+__mlu_entry__ void cos_kernel(
+    float *input,
+    float *output,
+    int total) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total / core_num;
+    uint32_t remainder = total % core_num;
+
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
+
+    __nram__ float nram[CHUNK_SIZE];
+
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
+        uint32_t len = (offset + CHUNK_SIZE <= count)
+                       ? CHUNK_SIZE : (count - offset);
+
+        __memcpy(nram, input + start + offset,
+                 len * sizeof(float), GDRAM2NRAM);
+
+        for (uint32_t i = 0; i < len; i++) {
+            nram[i] = fast_cos(nram[i]);
+        }
+
+        __memcpy(output + start + offset, nram,
+                 len * sizeof(float), NRAM2GDRAM);
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x) {
+
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    auto output_fp32 = torch::empty_like(x_fp32);
+    int total = x_fp32.numel();
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    cos_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        total);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
