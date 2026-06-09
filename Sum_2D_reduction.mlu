@@ -27,6 +27,7 @@ __mlu_entry__ void sum2d_reduction_kernel(
         int batch_idx = start + b;
         float *plane = input + batch_idx * plane_size;
         float sum = 0.0f;
+        float comp = 0.0f;
 
         for (int offset = 0; offset < plane_size; offset += CHUNK_SIZE) {
             int len = (offset + CHUNK_SIZE <= plane_size)
@@ -36,7 +37,10 @@ __mlu_entry__ void sum2d_reduction_kernel(
                      len * sizeof(float), GDRAM2NRAM);
 
             for (int i = 0; i < len; i++) {
-                sum += nram[i];
+                float y = nram[i] - comp;
+                float t = sum + y;
+                comp = (t - sum) - y;
+                sum = t;
             }
         }
 

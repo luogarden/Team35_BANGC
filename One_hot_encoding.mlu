@@ -5,7 +5,7 @@
 #define MAX_CLASSES 1024
 
 __mlu_entry__ void onehot_kernel(
-    int64_t *input,
+    float *input,
     float *output,
     int batch,
     int num_classes) {
@@ -19,17 +19,19 @@ __mlu_entry__ void onehot_kernel(
     uint32_t count = per_core +
                      (core_id < rem ? 1 : 0);
 
-    __nram__ int64_t nram_idx[1];
+    __nram__ float nram_idx[1];
     __nram__ float nram_row[MAX_CLASSES];
 
     for (uint32_t i = 0; i < count; i++) {
         int row = start + i;
 
         __memcpy(nram_idx, input + row,
-                 sizeof(int64_t), GDRAM2NRAM);
+                 sizeof(float), GDRAM2NRAM);
+
+        int class_idx = (int)nram_idx[0];
 
         __bang_write_value(nram_row, num_classes, 0.0f);
-        nram_row[(int)nram_idx[0]] = 1.0f;
+        nram_row[class_idx] = 1.0f;
 
         __memcpy(output + row * num_classes, nram_row,
                  num_classes * sizeof(float), NRAM2GDRAM);
@@ -48,9 +50,9 @@ torch::Tensor bang_func(
     auto output = torch::empty({(int64_t)batch, (int64_t)num_classes},
                                torch::kFloat);
 
-    auto x_long = x;
-    if (x_long.scalar_type() != torch::kLong) {
-        x_long = x.to(torch::kLong);
+    auto x_fp32 = x;
+    if (x_fp32.scalar_type() != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
     }
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
@@ -58,7 +60,7 @@ torch::Tensor bang_func(
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     onehot_kernel<<<dim, ktype, queue>>>(
-        reinterpret_cast<int64_t*>(x_long.data_ptr()),
+        x_fp32.data_ptr<float>(),
         output.data_ptr<float>(),
         batch, num_classes);
 

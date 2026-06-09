@@ -22,15 +22,19 @@ __mlu_entry__ void trace_kernel(
     for (uint32_t b = 0; b < count; b++) {
         int batch_idx = start + b;
         float *mat = A + batch_idx * N * N;
-        float trace = 0.0f;
+        float sum = 0.0f;
+        float comp = 0.0f;
 
         for (int i = 0; i < N; i++) {
             __memcpy(nram, mat + i * N + i,
                      sizeof(float), GDRAM2NRAM);
-            trace += nram[0];
+            float y = nram[0] - comp;
+            float t = sum + y;
+            comp = (t - sum) - y;
+            sum = t;
         }
 
-        nram[0] = trace;
+        nram[0] = sum;
         __memcpy(output + batch_idx, nram,
                  sizeof(float), NRAM2GDRAM);
     }
