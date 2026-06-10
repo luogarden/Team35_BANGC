@@ -1,0 +1,148 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CONV_TILE_W 128
+#define CONV_BUF_W 192
+
+__mlu_entry__ void pointwise_conv2d_kernel(
+    const float *x,
+    const float *kernel,
+    const float *bias,
+    float *out,
+    int B,
+    int IC,
+    int OC,
+    int H,
+    int W,
+    long long total_tiles) {
+
+  __nram__ float nram_x[CONV_BUF_W];
+  __nram__ float nram_tmp[CONV_BUF_W];
+  __nram__ float nram_acc[CONV_BUF_W];
+
+  int w_tiles = (W + CONV_TILE_W - 1) / CONV_TILE_W;
+
+  for (long long tile = taskId; tile < total_tiles; tile += taskDim) {
+    long long t = tile;
+
+    int wt = t % w_tiles;
+    t /= w_tiles;
+
+    int oh = t % H;
+    t /= H;
+
+    int oc = t % OC;
+    t /= OC;
+
+    int b = (int)t;
+
+    int ow_start = wt * CONV_TILE_W;
+    int len = W - ow_start;
+    if (len > CONV_TILE_W) {
+      len = CONV_TILE_W;
+    }
+
+    int aligned_len = (len + 63) & ~63;
+    __bang_write_value(nram_acc, CONV_BUF_W, 0.0f);
+
+    for (int ic = 0; ic < IC; ++ic) {
+      const float *x_ptr =
+          x + ((long long)b * IC * H * W) +
+          ((long long)ic * H * W) +
+          ((long long)oh * W) +
+          ow_start;
+
+      __bang_write_value(nram_x, aligned_len, 0.0f);
+      __memcpy(nram_x, x_ptr, len * sizeof(float), GDRAM2NRAM);
+
+      float w_val = kernel[(long long)oc * IC + ic];
+
+      __bang_mul_scalar(nram_tmp, nram_x, w_val, aligned_len);
+      __bang_add(
+          nram_acc,
+          nram_acc,
+          nram_tmp,
+          aligned_len);
+    }
+
+    if (bias != nullptr) {
+      float bv = bias[oc];
+      __bang_write_value(nram_tmp, aligned_len, bv);
+      __bang_add(
+          nram_acc,
+          nram_acc,
+          nram_tmp,
+          aligned_len);
+    }
+
+    float *out_ptr =
+        out + ((long long)b * OC * H * W) +
+        ((long long)oc * H * W) +
+        ((long long)oh * W) +
+        ow_start;
+
+    __memcpy(out_ptr, nram_acc, len * sizeof(float), NRAM2GDRAM);
+  }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor kernel,
+    int in_channels,
+    int out_channels,
+    bool bias) {
+
+  TORCH_CHECK(x.dim() == 4, "x must be 4D [batch, in_channels, H, W]");
+  TORCH_CHECK(kernel.dim() == 4, "kernel must be 4D [out_channels, in_channels, 1, 1]");
+
+  auto x_f = x.contiguous();
+  auto k_f = kernel.contiguous();
+  if (x_f.scalar_type() != torch::kFloat) {
+    x_f = x_f.to(torch::kFloat);
+  }
+  if (k_f.scalar_type() != torch::kFloat) {
+    k_f = k_f.to(torch::kFloat);
+  }
+  x_f = x_f.contiguous();
+  k_f = k_f.contiguous();
+
+  int B = x_f.size(0);
+  int IC = x_f.size(1);
+  int H = x_f.size(2);
+  int W = x_f.size(3);
+  int OC = out_channels;
+
+  TORCH_CHECK(IC == in_channels, "in_channels mismatch");
+  TORCH_CHECK(k_f.size(0) == out_channels, "kernel out_channels mismatch");
+  TORCH_CHECK(k_f.size(1) == in_channels, "kernel in_channels mismatch");
+  TORCH_CHECK(k_f.size(2) == 1 && k_f.size(3) == 1, "kernel must be 1x1");
+
+  auto out = torch::empty({B, OC, H, W}, x_f.options().dtype(torch::kFloat));
+
+  torch::Tensor b_f;
+  if (bias) {
+    b_f = torch::empty({OC}, x_f.options().dtype(torch::kFloat));
+  }
+
+  int w_tiles = (W + CONV_TILE_W - 1) / CONV_TILE_W;
+  long long total_tiles = (long long)B * OC * H * w_tiles;
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t dim = {256, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+  pointwise_conv2d_kernel<<<dim, ktype, queue>>>(
+      x_f.data_ptr<float>(),
+      k_f.data_ptr<float>(),
+      bias ? b_f.data_ptr<float>() : nullptr,
+      out.data_ptr<float>(),
+      B,
+      IC,
+      OC,
+      H,
+      W,
+      total_tiles);
+
+  return out;
+}
