@@ -1,0 +1,284 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+
+static inline float nram_exp(float x) {
+    const float inv_ln2 = 1.44269504088896341f;
+    const float ln2_hi = 0.693359375f;
+    const float ln2_lo = -0.00021217204052209854f;
+    union { float f; unsigned int u; } bits;
+    if (x < -87.3f) return 0.0f;
+    float kf = x * inv_ln2;
+    int k = (int)(kf + (kf >= 0.0f ? 0.5f : -0.5f));
+    float r = x - (float)k * ln2_hi - (float)k * ln2_lo;
+    float p = 1.0f + r * (1.0f + r * (0.5f +
+              r * (0.16666667163372039795f +
+              r * (0.04166668280959129333f +
+              r * (0.00833333097338676453f +
+              r * (0.00138889296869188547f +
+              r * (0.00019841069537773788f +
+              r * 0.000024793375991914592f)))))));
+    bits.u = (unsigned int)(k + 127) << 23;
+    return p * bits.f;
+}
+
+static inline float nram_sigmoid(float x) {
+    return 1.0f / (1.0f + nram_exp(-x));
+}
+
+
+__mlu_entry__ void gru_kernel(
+    const float *x,
+    const float *W_ih_l0,
+    const float *W_hh_l0,
+    const float *b_ih_l0,
+    const float *b_hh_l0,
+    const float *W_ih_l1,
+    const float *W_hh_l1,
+    const float *b_ih_l1,
+    const float *b_hh_l1,
+    float *inter_out,
+    float *final_out,
+    int B,
+    int seq,
+    int IS,
+    int H) {
+
+    int _3H = 3 * H;
+    __nram__ float nram_buf[CHUNK_SIZE];
+    __nram__ float nram_gate[CHUNK_SIZE];
+
+    int buf_wt_start = 2 * H;                 // 1024
+    int buf_wt_space = CHUNK_SIZE - 2 * H;    // 3072
+    int in_chunk0 = buf_wt_space / IS;        // 3072/256 = 12
+    int hh_chunk0 = buf_wt_space / H;         // 3072/512 = 6
+    int in_chunk1 = buf_wt_space / H;         // 3072/512 = 6
+    int hh_chunk1 = buf_wt_space / H;         // 3072/512 = 6
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = B / core_num;
+    uint32_t b_start = core_id * per_core;
+    uint32_t b_end = b_start + per_core;
+
+    // ========== Layer 0 ==========
+    for (int b = b_start; b < b_end; b++) {
+        const float *x_b = x + (long long)b * seq * IS;
+        float *out_b = inter_out + (long long)b * seq * H;
+
+        // h_prev at nram_buf[0..H-1], init to 0
+        for (int d = 0; d < H; d++) nram_buf[d] = 0.0f;
+
+        for (int t = 0; t < seq; t++) {
+            // Load x_t into nram_buf[H..H+IS-1]
+            const float *x_t = x_b + (long long)t * IS;
+            __memcpy(nram_buf + H, x_t, IS * sizeof(float), GDRAM2NRAM);
+
+            // ---- Compute gi = x_t @ W_ih_l0^T + b_ih_l0 ----
+            for (int oc = 0; oc < _3H; oc += in_chunk0) {
+                int rows = in_chunk0;
+                if (oc + rows > _3H) rows = _3H - oc;
+
+                __memcpy(nram_buf + buf_wt_start,
+                         W_ih_l0 + (long long)oc * IS,
+                         rows * IS * sizeof(float),
+                         GDRAM2NRAM);
+
+                for (int o = 0; o < rows; o++) {
+                    float sum = b_ih_l0[oc + o];
+                    for (int i = 0; i < IS; i++) {
+                        sum += nram_buf[H + i]
+                             * nram_buf[buf_wt_start + o * IS + i];
+                    }
+                    nram_gate[oc + o] = sum;
+                }
+            }
+
+            // ---- Compute gh = h_prev @ W_hh_l0^T + b_hh_l0 ----
+            for (int oc = 0; oc < _3H; oc += hh_chunk0) {
+                int rows = hh_chunk0;
+                if (oc + rows > _3H) rows = _3H - oc;
+
+                __memcpy(nram_buf + buf_wt_start,
+                         W_hh_l0 + (long long)oc * H,
+                         rows * H * sizeof(float),
+                         GDRAM2NRAM);
+
+                for (int o = 0; o < rows; o++) {
+                    float sum = b_hh_l0[oc + o];
+                    for (int i = 0; i < H; i++) {
+                        sum += nram_buf[i]
+                             * nram_buf[buf_wt_start + o * H + i];
+                    }
+                    nram_gate[_3H + oc + o] = sum;
+                }
+            }
+
+            // ---- Activations ----
+            // gi = nram_gate[0.._3H-1], gh = nram_gate[_3H..2*_3H-1]
+            // h_prev = nram_buf[0..H-1], h_new → nram_buf[H..2H-1]
+            float *p_gi = nram_gate;
+            float *p_gh = nram_gate + _3H;
+            float *p_hp = nram_buf;
+
+            for (int d = 0; d < H; d++) {
+                float gr = p_gi[d] + p_gh[d];
+                float gz = p_gi[H + d] + p_gh[H + d];
+                float gn_in = p_gi[2 * H + d]
+                            + nram_sigmoid(gr) * p_gh[2 * H + d];
+                float r  = nram_sigmoid(gr);
+                float z  = nram_sigmoid(gz);
+                float n  = nram_sigmoid(2.0f * gn_in);
+                n = 2.0f * n - 1.0f;  // tanh = 2*sigmoid(2x)-1
+                nram_buf[H + d] = (1.0f - z) * n + z * p_hp[d];
+            }
+
+            // Write h_new to GDRAM output
+            __memcpy(out_b + (long long)t * H,
+                     nram_buf + H,
+                     H * sizeof(float), NRAM2GDRAM);
+
+            // h_prev = h_new for next timestep
+            for (int d = 0; d < H; d++) nram_buf[d] = nram_buf[H + d];
+        }
+    }
+
+    // ========== Layer 1 ==========
+    for (int b = b_start; b < b_end; b++) {
+        const float *x_b = inter_out + (long long)b * seq * H;
+        float *out_b = final_out + (long long)b * seq * H;
+
+        for (int d = 0; d < H; d++) nram_buf[d] = 0.0f;
+
+        for (int t = 0; t < seq; t++) {
+            const float *x_t = x_b + (long long)t * H;
+            __memcpy(nram_buf + H, x_t, H * sizeof(float), GDRAM2NRAM);
+
+            // ---- Compute gi = x_t @ W_ih_l1^T + b_ih_l1 ----
+            for (int oc = 0; oc < _3H; oc += in_chunk1) {
+                int rows = in_chunk1;
+                if (oc + rows > _3H) rows = _3H - oc;
+
+                __memcpy(nram_buf + buf_wt_start,
+                         W_ih_l1 + (long long)oc * H,
+                         rows * H * sizeof(float),
+                         GDRAM2NRAM);
+
+                for (int o = 0; o < rows; o++) {
+                    float sum = b_ih_l1[oc + o];
+                    for (int i = 0; i < H; i++) {
+                        sum += nram_buf[H + i]
+                             * nram_buf[buf_wt_start + o * H + i];
+                    }
+                    nram_gate[oc + o] = sum;
+                }
+            }
+
+            // ---- Compute gh = h_prev @ W_hh_l1^T + b_hh_l1 ----
+            for (int oc = 0; oc < _3H; oc += hh_chunk1) {
+                int rows = hh_chunk1;
+                if (oc + rows > _3H) rows = _3H - oc;
+
+                __memcpy(nram_buf + buf_wt_start,
+                         W_hh_l1 + (long long)oc * H,
+                         rows * H * sizeof(float),
+                         GDRAM2NRAM);
+
+                for (int o = 0; o < rows; o++) {
+                    float sum = b_hh_l1[oc + o];
+                    for (int i = 0; i < H; i++) {
+                        sum += nram_buf[i]
+                             * nram_buf[buf_wt_start + o * H + i];
+                    }
+                    nram_gate[_3H + oc + o] = sum;
+                }
+            }
+
+            // ---- Activations ----
+            float *p_gi = nram_gate;
+            float *p_gh = nram_gate + _3H;
+            float *p_hp = nram_buf;
+
+            for (int d = 0; d < H; d++) {
+                float gr = p_gi[d] + p_gh[d];
+                float gz = p_gi[H + d] + p_gh[H + d];
+                float gn_in = p_gi[2 * H + d]
+                            + nram_sigmoid(gr) * p_gh[2 * H + d];
+                float r  = nram_sigmoid(gr);
+                float z  = nram_sigmoid(gz);
+                float n  = nram_sigmoid(2.0f * gn_in);
+                n = 2.0f * n - 1.0f;
+                nram_buf[H + d] = (1.0f - z) * n + z * p_hp[d];
+            }
+
+            __memcpy(out_b + (long long)t * H,
+                     nram_buf + H,
+                     H * sizeof(float), NRAM2GDRAM);
+
+            for (int d = 0; d < H; d++) nram_buf[d] = nram_buf[H + d];
+        }
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    int input_size,
+    int hidden_size,
+    int num_layers) {
+
+    TORCH_CHECK(x.dim() == 3, "x must be 3D [batch, seq_len, input_size]");
+    TORCH_CHECK(num_layers >= 1, "num_layers must be >= 1");
+
+    auto x_f = x.contiguous();
+    if (x_f.scalar_type() != torch::kFloat) {
+        x_f = x_f.to(torch::kFloat);
+    }
+    x_f = x_f.contiguous();
+
+    int B = (int)x_f.size(0);
+    int seq = (int)x_f.size(1);
+    int IS = input_size;
+    int H = hidden_size;
+
+    auto opts = x_f.options().dtype(torch::kFloat);
+
+    auto W_ih_l0 = torch::empty({3 * H, IS}, opts);
+    auto W_hh_l0 = torch::empty({3 * H, H}, opts);
+    auto b_ih_l0 = torch::empty({3 * H}, opts);
+    auto b_hh_l0 = torch::empty({3 * H}, opts);
+
+    auto W_ih_l1 = torch::empty({3 * H, H}, opts);
+    auto W_hh_l1 = torch::empty({3 * H, H}, opts);
+    auto b_ih_l1 = torch::empty({3 * H}, opts);
+    auto b_hh_l1 = torch::empty({3 * H}, opts);
+
+    auto inter_out = torch::empty({B, seq, H}, opts);
+    auto out = torch::empty({B, seq, H}, opts);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    gru_kernel<<<dim, ktype, queue>>>(
+        x_f.data_ptr<float>(),
+        W_ih_l0.data_ptr<float>(),
+        W_hh_l0.data_ptr<float>(),
+        b_ih_l0.data_ptr<float>(),
+        b_hh_l0.data_ptr<float>(),
+        W_ih_l1.data_ptr<float>(),
+        W_hh_l1.data_ptr<float>(),
+        b_ih_l1.data_ptr<float>(),
+        b_hh_l1.data_ptr<float>(),
+        inter_out.data_ptr<float>(),
+        out.data_ptr<float>(),
+        B,
+        seq,
+        IS,
+        H);
+
+    return out;
+}
