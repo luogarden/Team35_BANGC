@@ -2,105 +2,129 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define ROW_BUF 2048
+#define CONV_TILE_W 128
+#define CONV_BUF_W 192
 
 __mlu_entry__ void depthwise_separable_conv2d_kernel(
-    float *x,
-    float *dw_kernel,
-    float *pw_kernel,
-    float *output,
-    int batch,
-    int in_c,
-    int out_c,
+    const float *x,
+    const float *dw_kernel,
+    const float *pw_kernel,
+    float *out,
+    int B,
+    int IC,
+    int OC,
     int H,
     int W,
     int K,
     int stride,
     int padding,
     int dilation,
-    int H_out,
-    int W_out) {
+    int OH,
+    int OW,
+    long long total_tiles) {
 
-    int spatial = H * W;
-    int out_spatial = H_out * W_out;
-    int total_positions = batch * out_spatial;
-    int kernel_area = K * K;
+  __nram__ float nram_x[CONV_BUF_W];
+  __nram__ float nram_tmp[CONV_BUF_W];
+  __nram__ float nram_acc[CONV_BUF_W];
 
-    __nram__ float nram_kern[ROW_BUF];
-    __nram__ float nram_io[ROW_BUF];
+  int w_tiles = (OW + CONV_TILE_W - 1) / CONV_TILE_W;
 
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t per_core = total_positions / core_num;
-    uint32_t rem = total_positions % core_num;
-    uint32_t p_start = core_id * per_core +
-                       (core_id < rem ? core_id : rem);
-    uint32_t p_count = per_core +
-                       (core_id < rem ? 1 : 0);
+  for (long long tile = taskId; tile < total_tiles; tile += taskDim) {
+    long long t = tile;
 
-    for (uint32_t p = 0; p < p_count; p++) {
-        uint32_t flat = p_start + p;
-        int pos = flat % out_spatial;
-        int b = flat / out_spatial;
-        int h_out = pos / W_out;
-        int w_out = pos % W_out;
+    int wt = t % w_tiles;
+    t /= w_tiles;
 
-        int in_h_start = h_out * stride - padding;
-        int in_w_start = w_out * stride - padding;
+    int oh = t % OH;
+    t /= OH;
 
-        for (int c = 0; c < in_c; c++) {
-            __memcpy(nram_kern, dw_kernel + c * kernel_area,
-                     kernel_area * sizeof(float), GDRAM2NRAM);
+    int oc = t % OC;
+    t /= OC;
 
-            int plane_offset = (int)(b * in_c + c) * spatial;
-            float dw_sum = 0.0f;
+    int b = (int)t;
 
-            for (int kh = 0; kh < K; kh++) {
-                int h_idx = in_h_start + kh * dilation;
-
-                if (h_idx >= 0 && h_idx < H &&
-                    in_w_start >= 0 && in_w_start + K * dilation <= W) {
-                    __memcpy(nram_io,
-                             x + plane_offset + h_idx * W + in_w_start,
-                             K * dilation * sizeof(float),
-                             GDRAM2NRAM);
-                    for (int kw = 0; kw < K; kw++) {
-                        dw_sum += nram_io[kw * dilation] *
-                                  nram_kern[kh * K + kw];
-                    }
-                } else {
-                    for (int kw = 0; kw < K; kw++) {
-                        int w_idx = in_w_start + kw * dilation;
-                        float val = 0.0f;
-                        if (h_idx >= 0 && h_idx < H &&
-                            w_idx >= 0 && w_idx < W) {
-                            __memcpy(nram_io + 1,
-                                     x + plane_offset + h_idx * W + w_idx,
-                                     sizeof(float), GDRAM2NRAM);
-                            val = nram_io[1];
-                        }
-                        dw_sum += val * nram_kern[kh * K + kw];
-                    }
-                }
-            }
-            nram_io[c] = dw_sum;
-        }
-
-        for (int oc = 0; oc < out_c; oc++) {
-            __memcpy(nram_kern, pw_kernel + oc * in_c,
-                     in_c * sizeof(float), GDRAM2NRAM);
-
-            float sum = 0.0f;
-            for (int c = 0; c < in_c; c++) {
-                sum += nram_io[c] * nram_kern[c];
-            }
-            int out_offset = (b * out_c + oc) * out_spatial + pos;
-            __memcpy(output + out_offset, &sum,
-                     sizeof(float), NRAM2GDRAM);
-        }
+    int ow_start = wt * CONV_TILE_W;
+    int len = OW - ow_start;
+    if (len > CONV_TILE_W) {
+      len = CONV_TILE_W;
     }
-}
 
+    int aligned_len = (len + 63) & ~63;
+    __bang_write_value(nram_acc, CONV_BUF_W, 0.0f);
+
+    for (int ic = 0; ic < IC; ++ic) {
+      __bang_write_value(nram_tmp, CONV_BUF_W, 0.0f);
+
+      for (int kh = 0; kh < K; ++kh) {
+        int ih = oh * stride - padding + kh * dilation;
+        if (ih < 0 || ih >= H) {
+          continue;
+        }
+
+        for (int kw = 0; kw < K; ++kw) {
+          int iw_start = ow_start - padding + kw * dilation;
+
+          int valid_start = 0;
+          if (iw_start < 0) {
+            valid_start = -iw_start;
+          }
+
+          int valid_end = len;
+          if (iw_start + valid_end > W) {
+            valid_end = W - iw_start;
+          }
+
+          if (valid_end <= valid_start) {
+            continue;
+          }
+
+          int vlen = valid_end - valid_start;
+          int aligned_vlen = (vlen + 63) & ~63;
+
+          const float *x_ptr =
+              x + ((long long)b * IC * H * W) +
+              ((long long)ic * H * W) +
+              ((long long)ih * W) +
+              (iw_start + valid_start);
+
+          __bang_write_value(nram_x, aligned_vlen, 0.0f);
+          __memcpy(nram_x, x_ptr, vlen * sizeof(float), GDRAM2NRAM);
+
+          long long dw_idx =
+              ((long long)ic * K * K) +
+              ((long long)kh * K) +
+              kw;
+          float dw_val = dw_kernel[dw_idx];
+
+          __bang_mul_scalar(nram_x, nram_x, dw_val, aligned_vlen);
+
+          __bang_add(
+              nram_tmp + valid_start,
+              nram_tmp + valid_start,
+              nram_x,
+              aligned_vlen);
+        }
+      }
+
+      float pw_val = pw_kernel[(long long)oc * IC + ic];
+
+      __bang_mul_scalar(nram_x, nram_tmp, pw_val, aligned_len);
+      __bang_add(
+          nram_acc,
+          nram_acc,
+          nram_x,
+          aligned_len);
+    }
+
+    float *out_ptr =
+        out + ((long long)b * OC * OH * OW) +
+        ((long long)oc * OH * OW) +
+        ((long long)oh * W) +
+        ow_start;
+
+    __memcpy(out_ptr, nram_acc, len * sizeof(float), NRAM2GDRAM);
+  }
+}
 
 torch::Tensor bang_func(
     torch::Tensor x,
@@ -113,56 +137,71 @@ torch::Tensor bang_func(
     int padding,
     int dilation) {
 
-    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
-    TORCH_CHECK(depthwise_kernel.is_contiguous(), "depthwise kernel must be contiguous");
-    TORCH_CHECK(pointwise_kernel.is_contiguous(), "pointwise kernel must be contiguous");
-    TORCH_CHECK(x.dim() == 4, "x must be 4D");
+  TORCH_CHECK(x.dim() == 4, "x must be 4D [batch, in_channels, H, W]");
+  TORCH_CHECK(depthwise_kernel.dim() == 4, "depthwise kernel must be 4D [in_channels, 1, K, K]");
+  TORCH_CHECK(pointwise_kernel.dim() == 4, "pointwise kernel must be 4D [out_channels, in_channels, 1, 1]");
 
-    auto original_dtype = x.scalar_type();
+  auto x_f = x.contiguous();
+  auto dw_f = depthwise_kernel.contiguous();
+  auto pw_f = pointwise_kernel.contiguous();
+  if (x_f.scalar_type() != torch::kFloat) {
+    x_f = x_f.to(torch::kFloat);
+  }
+  if (dw_f.scalar_type() != torch::kFloat) {
+    dw_f = dw_f.to(torch::kFloat);
+  }
+  if (pw_f.scalar_type() != torch::kFloat) {
+    pw_f = pw_f.to(torch::kFloat);
+  }
+  x_f = x_f.contiguous();
+  dw_f = dw_f.contiguous();
+  pw_f = pw_f.contiguous();
 
-    torch::Tensor x_fp32 = x;
-    torch::Tensor dw_fp32 = depthwise_kernel;
-    torch::Tensor pw_fp32 = pointwise_kernel;
+  int B = x_f.size(0);
+  int IC = x_f.size(1);
+  int H = x_f.size(2);
+  int W = x_f.size(3);
+  int OC = out_channels;
+  int K = kernel_size;
 
-    if (original_dtype != torch::kFloat) {
-        x_fp32 = x.to(torch::kFloat);
-    }
-    if (depthwise_kernel.scalar_type() != torch::kFloat) {
-        dw_fp32 = depthwise_kernel.to(torch::kFloat);
-    }
-    if (pointwise_kernel.scalar_type() != torch::kFloat) {
-        pw_fp32 = pointwise_kernel.to(torch::kFloat);
-    }
+  TORCH_CHECK(IC == in_channels, "in_channels mismatch");
+  TORCH_CHECK(dw_f.size(0) == in_channels, "dw kernel out_channels mismatch");
+  TORCH_CHECK(dw_f.size(1) == 1, "dw kernel must have 1 group channel");
+  TORCH_CHECK(dw_f.size(2) == kernel_size && dw_f.size(3) == kernel_size, "dw kernel_size mismatch");
+  TORCH_CHECK(pw_f.size(0) == out_channels, "pw kernel out_channels mismatch");
+  TORCH_CHECK(pw_f.size(1) == in_channels, "pw kernel in_channels mismatch");
+  TORCH_CHECK(pw_f.size(2) == 1 && pw_f.size(3) == 1, "pw kernel must be 1x1");
 
-    int batch = (int)x_fp32.size(0);
-    int H = (int)x_fp32.size(2);
-    int W = (int)x_fp32.size(3);
-    int K = kernel_size;
+  int OH = (H + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
+  int OW = (W + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
+  TORCH_CHECK(OH > 0 && OW > 0, "invalid output shape");
 
-    int H_out = (H + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
-    int W_out = (W + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
+  auto out = torch::empty({B, OC, OH, OW}, x_f.options().dtype(torch::kFloat));
 
-    auto output_fp32 = torch::empty(
-        {(int64_t)batch, (int64_t)out_channels,
-         (int64_t)H_out, (int64_t)W_out},
-        x_fp32.options());
+  int w_tiles = (OW + CONV_TILE_W - 1) / CONV_TILE_W;
+  long long total_tiles = (long long)B * OC * OH * w_tiles;
 
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t dim = {256, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
-    depthwise_separable_conv2d_kernel<<<dim, ktype, queue>>>(
-        x_fp32.data_ptr<float>(),
-        dw_fp32.data_ptr<float>(),
-        pw_fp32.data_ptr<float>(),
-        output_fp32.data_ptr<float>(),
-        batch, in_channels, out_channels, H, W,
-        K, stride, padding, dilation,
-        H_out, W_out);
+  depthwise_separable_conv2d_kernel<<<dim, ktype, queue>>>(
+      x_f.data_ptr<float>(),
+      dw_f.data_ptr<float>(),
+      pw_f.data_ptr<float>(),
+      out.data_ptr<float>(),
+      B,
+      IC,
+      OC,
+      H,
+      W,
+      K,
+      stride,
+      padding,
+      dilation,
+      OH,
+      OW,
+      total_tiles);
 
-    if (original_dtype != torch::kFloat) {
-        return output_fp32.to(original_dtype);
-    }
-
-    return output_fp32;
+  return out;
 }
