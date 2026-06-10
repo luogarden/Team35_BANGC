@@ -1,0 +1,172 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CONV_TILE_W 128
+#define CONV_BUF_W 192
+
+__mlu_entry__ void depthwise_conv2d_kernel(
+    const float *x,
+    const float *kernel,
+    float *out,
+    int B,
+    int IC,
+    int H,
+    int W,
+    int K,
+    int stride,
+    int padding,
+    int OH,
+    int OW,
+    long long total_tiles) {
+
+  __nram__ float nram_x[CONV_BUF_W];
+  __nram__ float nram_tmp[CONV_BUF_W];
+  __nram__ float nram_acc[CONV_BUF_W];
+
+  int w_tiles = (OW + CONV_TILE_W - 1) / CONV_TILE_W;
+
+  for (long long tile = taskId; tile < total_tiles; tile += taskDim) {
+    long long t = tile;
+
+    int wt = t % w_tiles;
+    t /= w_tiles;
+
+    int oh = t % OH;
+    t /= OH;
+
+    int oc = t % IC;
+    t /= IC;
+
+    int b = (int)t;
+
+    int ow_start = wt * CONV_TILE_W;
+    int len = OW - ow_start;
+    if (len > CONV_TILE_W) {
+      len = CONV_TILE_W;
+    }
+
+    int aligned_len = (len + 63) & ~63;
+    __bang_write_value(nram_acc, CONV_BUF_W, 0.0f);
+
+    for (int kh = 0; kh < K; ++kh) {
+      int ih = oh * stride - padding + kh;
+      if (ih < 0 || ih >= H) {
+        continue;
+      }
+
+      for (int kw = 0; kw < K; ++kw) {
+        int iw_start = ow_start - padding + kw;
+
+        int valid_start = 0;
+        if (iw_start < 0) {
+          valid_start = -iw_start;
+        }
+
+        int valid_end = len;
+        if (iw_start + valid_end > W) {
+          valid_end = W - iw_start;
+        }
+
+        if (valid_end <= valid_start) {
+          continue;
+        }
+
+        int vlen = valid_end - valid_start;
+        int aligned_vlen = (vlen + 63) & ~63;
+
+        const float *x_ptr =
+            x + ((long long)b * IC * H * W) +
+            ((long long)oc * H * W) +
+            ((long long)ih * W) +
+            (iw_start + valid_start);
+
+        __bang_write_value(nram_x, aligned_vlen, 0.0f);
+        __memcpy(nram_x, x_ptr, vlen * sizeof(float), GDRAM2NRAM);
+
+        float w_val = kernel[((long long)oc * K * K) +
+                             ((long long)kh * K) +
+                             kw];
+
+        __bang_mul_scalar(nram_tmp, nram_x, w_val, aligned_vlen);
+        __bang_add(
+            nram_acc + valid_start,
+            nram_acc + valid_start,
+            nram_tmp,
+            aligned_vlen);
+      }
+    }
+
+    float *out_ptr =
+        out + ((long long)b * IC * OH * OW) +
+        ((long long)oc * OH * OW) +
+        ((long long)oh * OW) +
+        ow_start;
+
+    __memcpy(out_ptr, nram_acc, len * sizeof(float), NRAM2GDRAM);
+  }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor kernel,
+    int in_channels,
+    int kernel_size,
+    int stride,
+    int padding) {
+
+  TORCH_CHECK(x.dim() == 4, "x must be 4D [batch, in_channels, H, W]");
+  TORCH_CHECK(kernel.dim() == 4, "kernel must be 4D [in_channels, 1, K, K]");
+
+  auto x_f = x.contiguous();
+  auto k_f = kernel.contiguous();
+  if (x_f.scalar_type() != torch::kFloat) {
+    x_f = x_f.to(torch::kFloat);
+  }
+  if (k_f.scalar_type() != torch::kFloat) {
+    k_f = k_f.to(torch::kFloat);
+  }
+  x_f = x_f.contiguous();
+  k_f = k_f.contiguous();
+
+  int B = x_f.size(0);
+  int IC = x_f.size(1);
+  int H = x_f.size(2);
+  int W = x_f.size(3);
+  int K = kernel_size;
+
+  TORCH_CHECK(IC == in_channels, "in_channels mismatch");
+  TORCH_CHECK(k_f.size(0) == in_channels, "kernel out_channels mismatch");
+  TORCH_CHECK(k_f.size(1) == 1, "kernel must have 1 group channel");
+  TORCH_CHECK(k_f.size(2) == kernel_size && k_f.size(3) == kernel_size, "kernel_size mismatch");
+
+  int OH = (H + 2 * padding - K) / stride + 1;
+  int OW = (W + 2 * padding - K) / stride + 1;
+  TORCH_CHECK(OH > 0 && OW > 0, "invalid output shape");
+
+  auto out = torch::empty({B, IC, OH, OW}, x_f.options().dtype(torch::kFloat));
+
+  int w_tiles = (OW + CONV_TILE_W - 1) / CONV_TILE_W;
+  long long total_tiles = (long long)B * IC * OH * w_tiles;
+
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t dim = {256, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+  depthwise_conv2d_kernel<<<dim, ktype, queue>>>(
+      x_f.data_ptr<float>(),
+      k_f.data_ptr<float>(),
+      out.data_ptr<float>(),
+      B,
+      IC,
+      H,
+      W,
+      K,
+      stride,
+      padding,
+      OH,
+      OW,
+      total_tiles);
+
+  return out;
+}
