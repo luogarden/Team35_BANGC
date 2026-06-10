@@ -22,6 +22,7 @@ __mlu_entry__ void dilated_conv2d_float_kernel(
     long long total_tiles) {
 
   __nram__ float nram_x[CONV_BUF_W];
+  __nram__ float nram_w[CONV_BUF_W];
   __nram__ float nram_acc[CONV_BUF_W];
 
   int w_tiles = (OW + CONV_TILE_W - 1) / CONV_TILE_W;
@@ -90,10 +91,11 @@ __mlu_entry__ void dilated_conv2d_float_kernel(
               kw;
           float w_val = kernel[w_idx];
 
+          __bang_write_value(nram_w, aligned_vlen, w_val);
           __bang_mac(
               nram_acc + valid_start,
               nram_x,
-              w_val,
+              nram_w,
               aligned_vlen);
         }
       }
