@@ -240,8 +240,5 @@ torch::Tensor bang_func(
             width_out);
     }
 
-    if (original_dtype != torch::kFloat) {
-        return output_fp32.to(original_dtype);
-    }
     return output_fp32;
 }
