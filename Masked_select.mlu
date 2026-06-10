@@ -1,0 +1,168 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+#define TASK_NUM 4
+
+__mlu_entry__ void count_kernel(
+    float *input,
+    int32_t *per_core_cnt,
+    float threshold,
+    int total) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total / core_num;
+    uint32_t rem = total % core_num;
+    uint32_t start = core_id * per_core +
+                     (core_id < rem ? core_id : rem);
+    uint32_t count = per_core +
+                     (core_id < rem ? 1 : 0);
+
+    __nram__ float nram_in[CHUNK_SIZE];
+    int32_t local_cnt = 0;
+
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
+        uint32_t len = (offset + CHUNK_SIZE <= count)
+                       ? CHUNK_SIZE : (count - offset);
+
+        __memcpy(nram_in, input + start + offset,
+                 len * sizeof(float), GDRAM2NRAM);
+
+        for (uint32_t i = 0; i < len; i++) {
+            if (nram_in[i] > threshold) {
+                local_cnt++;
+            }
+        }
+    }
+
+    per_core_cnt[core_id] = local_cnt;
+}
+
+
+__mlu_entry__ void compact_kernel(
+    float *input,
+    float *output,
+    int32_t *per_core_offsets,
+    float threshold,
+    int total) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total / core_num;
+    uint32_t rem = total % core_num;
+    uint32_t start = core_id * per_core +
+                     (core_id < rem ? core_id : rem);
+    uint32_t count = per_core +
+                     (core_id < rem ? 1 : 0);
+
+    int32_t base_offset = per_core_offsets[core_id];
+    int32_t running_offset = 0;
+
+    __nram__ float nram_in[CHUNK_SIZE];
+    __nram__ float nram_out[CHUNK_SIZE];
+
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
+        uint32_t len = (offset + CHUNK_SIZE <= count)
+                       ? CHUNK_SIZE : (count - offset);
+
+        __memcpy(nram_in, input + start + offset,
+                 len * sizeof(float), GDRAM2NRAM);
+
+        int32_t local_cnt = 0;
+        for (uint32_t i = 0; i < len; i++) {
+            if (nram_in[i] > threshold) {
+                nram_out[local_cnt] = nram_in[i];
+                local_cnt++;
+            }
+        }
+
+        if (local_cnt > 0) {
+            __memcpy(output + base_offset + running_offset,
+                     nram_out,
+                     local_cnt * sizeof(float),
+                     NRAM2GDRAM);
+            running_offset += local_cnt;
+        }
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor input,
+    double threshold) {
+
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(input.dim() == 2, "input must be a 2D tensor");
+    TORCH_CHECK(input.size(0) == 1024 && input.size(1) == 1024,
+                "input shape must be [1024, 1024]");
+
+    auto original_dtype = input.scalar_type();
+    torch::Tensor input_fp32 = input;
+    bool uses_temporary = false;
+
+    if (original_dtype != torch::kFloat) {
+        input_fp32 = input.to(torch::kFloat);
+        uses_temporary = true;
+    }
+
+    int total = (int)input_fp32.numel();
+    float threshold_fp32 = (float)threshold;
+
+    auto counts_dev =
+        torch::zeros({TASK_NUM},
+                     torch::TensorOptions()
+                         .dtype(torch::kInt32)
+                         .device(input_fp32.device()));
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {TASK_NUM, 1, 1};
+    cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_BLOCK;
+
+    count_kernel<<<dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        counts_dev.data_ptr<int32_t>(),
+        threshold_fp32,
+        total);
+
+    cnrtQueueSync(queue);
+
+    auto counts_cpu = counts_dev.to(torch::kCPU);
+    int32_t *cnt = counts_cpu.data_ptr<int32_t>();
+
+    int32_t offsets_host[TASK_NUM];
+    offsets_host[0] = 0;
+    for (int i = 1; i < TASK_NUM; i++) {
+        offsets_host[i] = offsets_host[i - 1] + cnt[i - 1];
+    }
+    int32_t total_selected = offsets_host[TASK_NUM - 1] + cnt[TASK_NUM - 1];
+
+    if (total_selected == 0) {
+        return torch::empty({0}, input_fp32.options());
+    }
+
+    auto offsets_dev =
+        torch::from_blob(offsets_host, {TASK_NUM}, torch::kInt32)
+            .to(input_fp32.device());
+
+    auto output_fp32 =
+        torch::empty({(int64_t)total_selected}, input_fp32.options());
+
+    compact_kernel<<<dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        offsets_dev.data_ptr<int32_t>(),
+        threshold_fp32,
+        total);
+
+    if (uses_temporary || original_dtype != torch::kFloat) {
+        cnrtQueueSync(queue);
+    }
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
