@@ -119,7 +119,7 @@ __mlu_entry__ void depthwise_separable_conv2d_kernel(
     float *out_ptr =
         out + ((long long)b * OC * OH * OW) +
         ((long long)oc * OH * OW) +
-        ((long long)oh * W) +
+        ((long long)oh * OW) +
         ow_start;
 
     __memcpy(out_ptr, nram_acc, len * sizeof(float), NRAM2GDRAM);
