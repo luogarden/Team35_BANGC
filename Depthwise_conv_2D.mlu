@@ -2,7 +2,7 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CHUNK_SIZE 4096
+#define CHUNK_SIZE 256
 
 __mlu_entry__ void depthwise_conv2d_kernel(
     float *x,
@@ -18,7 +18,6 @@ __mlu_entry__ void depthwise_conv2d_kernel(
     int H_out,
     int W_out) {
 
-    int spatial = H * W;
     int out_spatial = H_out * W_out;
     int total_out = batch * channels * out_spatial;
     int kernel_area = K * K;
@@ -49,7 +48,6 @@ __mlu_entry__ void depthwise_conv2d_kernel(
 
         int in_h_start = h_out * stride - padding;
         int in_w_start = w_out * stride - padding;
-        int plane_offset = (b * channels + c) * spatial;
 
         float sum = 0.0f;
         for (int kh = 0; kh < K; kh++) {
@@ -58,7 +56,7 @@ __mlu_entry__ void depthwise_conv2d_kernel(
             if (h_idx >= 0 && h_idx < H &&
                 in_w_start >= 0 && in_w_start + K <= W) {
                 __memcpy(nram_row,
-                         x + plane_offset + h_idx * W + in_w_start,
+                         x + ((b * channels + c) * H + h_idx) * W + in_w_start,
                          K * sizeof(float), GDRAM2NRAM);
                 for (int kw = 0; kw < K; kw++) {
                     sum += nram_row[kw] * nram_kernel[kh * K + kw];
@@ -70,7 +68,7 @@ __mlu_entry__ void depthwise_conv2d_kernel(
                     if (h_idx >= 0 && h_idx < H &&
                         w_idx >= 0 && w_idx < W) {
                         __memcpy(nram_row,
-                                 x + plane_offset + h_idx * W + w_idx,
+                                 x + ((b * channels + c) * H + h_idx) * W + w_idx,
                                  sizeof(float), GDRAM2NRAM);
                         val = nram_row[0];
                     }
@@ -80,9 +78,7 @@ __mlu_entry__ void depthwise_conv2d_kernel(
         }
 
         nram_kernel[0] = sum;
-        int out_offset = (b * channels + c) * out_spatial
-                         + h_out * W_out + w_out;
-        __memcpy(output + out_offset, nram_kernel,
+        __memcpy(output + flat, nram_kernel,
                  sizeof(float), NRAM2GDRAM);
     }
 }
