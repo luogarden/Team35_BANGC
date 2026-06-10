@@ -2,117 +2,114 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CHUNK_SIZE 4096
+#define CONV_TILE_W 128
+#define CONV_BUF_W 192
 
-__mlu_entry__ void dilated_conv2d_kernel(
-    float *x,
-    float *kernel,
-    float *output,
-    int batch,
-    int in_channels,
-    int out_channels,
+__mlu_entry__ void dilated_conv2d_float_kernel(
+    const float *x,
+    const float *kernel,
+    float *out,
+    int B,
+    int IC,
+    int OC,
     int H,
     int W,
     int K,
     int dilation,
     int padding,
-    int H_out,
-    int W_out) {
+    int OH,
+    int OW,
+    long long total_tiles) {
 
-    int spatial = H * W;
-    int out_spatial = H_out * W_out;
-    int col_size = in_channels * K * K;
-    int num_spatial = batch * out_spatial;
-    const int TILE_OC = 6;
+  __nram__ float nram_x[CONV_BUF_W];
+  __nram__ float nram_tmp[CONV_BUF_W];
+  __nram__ float nram_acc[CONV_BUF_W];
 
-    __nram__ float nram_col[CHUNK_SIZE];
-    __nram__ float nram_kern[CHUNK_SIZE];
+  int w_tiles = (OW + CONV_TILE_W - 1) / CONV_TILE_W;
 
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t per_core = num_spatial / core_num;
-    uint32_t rem = num_spatial % core_num;
-    uint32_t start = core_id * per_core +
-                     (core_id < rem ? core_id : rem);
-    uint32_t count = per_core +
-                     (core_id < rem ? 1 : 0);
+  for (long long tile = taskId; tile < total_tiles; tile += taskDim) {
+    long long t = tile;
 
-    for (int oc_start = 0; oc_start < out_channels; oc_start += TILE_OC) {
-        int cur_tile = TILE_OC;
-        if (oc_start + TILE_OC > out_channels) {
-            cur_tile = out_channels - oc_start;
-        }
+    int wt = t % w_tiles;
+    t /= w_tiles;
 
-        __memcpy(nram_kern,
-                 kernel + oc_start * col_size,
-                 cur_tile * col_size * sizeof(float),
-                 GDRAM2NRAM);
+    int oh = t % OH;
+    t /= OH;
 
-        for (uint32_t idx = 0; idx < count; idx++) {
-            uint32_t flat = start + idx;
-            int w_out = flat % W_out;
-            int tmp = flat / W_out;
-            int h_out = tmp % H_out;
-            int b = tmp / H_out;
+    int oc = t % OC;
+    t /= OC;
 
-            int in_h_start = h_out - padding;
-            int in_w_start = w_out - padding;
+    int b = (int)t;
 
-            int col_idx = 0;
-
-            for (int ic = 0; ic < in_channels; ic++) {
-                int plane_offset = (b * in_channels + ic) * spatial;
-
-                for (int kh = 0; kh < K; kh++) {
-                    int h_idx = in_h_start + kh * dilation;
-
-                    if (h_idx >= 0 && h_idx < H &&
-                        in_w_start >= 0 && in_w_start + K * dilation <= W) {
-                        __memcpy(nram_col + col_idx,
-                                 x + plane_offset + h_idx * W + in_w_start,
-                                 K * dilation * sizeof(float),
-                                 GDRAM2NRAM);
-                        for (int kw = 0; kw < K; kw++) {
-                            nram_col[col_idx + kw] =
-                                nram_col[col_idx + kw * dilation];
-                        }
-                        col_idx += K;
-                    } else {
-                        for (int kw = 0; kw < K; kw++) {
-                            int w_idx = in_w_start + kw * dilation;
-                            float val = 0.0f;
-                            if (h_idx >= 0 && h_idx < H &&
-                                w_idx >= 0 && w_idx < W) {
-                                __memcpy(nram_col + col_idx,
-                                         x + plane_offset + h_idx * W + w_idx,
-                                         sizeof(float), GDRAM2NRAM);
-                                val = nram_col[col_idx];
-                            }
-                            nram_col[col_idx] = val;
-                            col_idx++;
-                        }
-                    }
-                }
-            }
-
-            int out_base = (b * out_channels * out_spatial)
-                           + h_out * W_out + w_out;
-
-            for (int t = 0; t < cur_tile; t++) {
-                float sum = 0.0f;
-                for (int k = 0; k < col_size; k++) {
-                    sum += nram_col[k] * nram_kern[t * col_size + k];
-                }
-                int oc = oc_start + t;
-                nram_col[col_size] = sum;
-                __memcpy(output + out_base + oc * out_spatial,
-                         nram_col + col_size,
-                         sizeof(float), NRAM2GDRAM);
-            }
-        }
+    int ow_start = wt * CONV_TILE_W;
+    int len = OW - ow_start;
+    if (len > CONV_TILE_W) {
+      len = CONV_TILE_W;
     }
-}
+    __bang_write_value(nram_acc, CONV_BUF_W, 0.0f);
 
+    for (int ic = 0; ic < IC; ++ic) {
+      for (int kh = 0; kh < K; ++kh) {
+        int ih = oh - padding + kh * dilation;
+        if (ih < 0 || ih >= H) {
+          continue;
+        }
+
+        for (int kw = 0; kw < K; ++kw) {
+          int iw_start = ow_start - padding + kw * dilation;
+
+          int valid_start = 0;
+          if (iw_start < 0) {
+            valid_start = -iw_start;
+          }
+
+          int valid_end = len;
+          if (iw_start + valid_end > W) {
+            valid_end = W - iw_start;
+          }
+
+          if (valid_end <= valid_start) {
+            continue;
+          }
+
+          int vlen = valid_end - valid_start;
+          int aligned_vlen = (vlen + 63) & ~63;
+
+          const float *x_ptr =
+              x + ((long long)b * IC * H * W) +
+              ((long long)ic * H * W) +
+              ((long long)ih * W) +
+              (iw_start + valid_start);
+
+          __bang_write_value(nram_x, aligned_vlen, 0.0f);
+          __memcpy(nram_x, x_ptr, vlen * sizeof(float), GDRAM2NRAM);
+
+          long long w_idx =
+              ((long long)oc * IC * K * K) +
+              ((long long)ic * K * K) +
+              ((long long)kh * K) +
+              kw;
+          float w_val = kernel[w_idx];
+
+          __bang_mul_scalar(nram_tmp, nram_x, w_val, aligned_vlen);
+          __bang_add(
+              nram_acc + valid_start,
+              nram_acc + valid_start,
+              nram_tmp,
+              aligned_vlen);
+        }
+      }
+    }
+
+    float *out_ptr =
+        out + ((long long)b * OC * OH * OW) +
+        ((long long)oc * OH * OW) +
+        ((long long)oh * OW) +
+        ow_start;
+
+    __memcpy(out_ptr, nram_acc, len * sizeof(float), NRAM2GDRAM);
+  }
+}
 
 torch::Tensor bang_func(
     torch::Tensor x,
@@ -123,51 +120,61 @@ torch::Tensor bang_func(
     int dilation,
     int padding) {
 
-    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
-    TORCH_CHECK(kernel.is_contiguous(), "kernel must be contiguous");
-    TORCH_CHECK(x.dim() == 4, "x must be 4D");
-    TORCH_CHECK(kernel.dim() == 4, "kernel must be 4D");
+  TORCH_CHECK(x.dim() == 4, "x must be 4D [batch, in_channels, H, W]");
+  TORCH_CHECK(kernel.dim() == 4, "kernel must be 4D [out_channels, in_channels, K, K]");
 
-    auto original_dtype = x.scalar_type();
+  auto x_f = x.contiguous();
+  auto k_f = kernel.contiguous();
+  if (x_f.scalar_type() != torch::kFloat) {
+    x_f = x_f.to(torch::kFloat);
+  }
+  if (k_f.scalar_type() != torch::kFloat) {
+    k_f = k_f.to(torch::kFloat);
+  }
+  x_f = x_f.contiguous();
+  k_f = k_f.contiguous();
 
-    torch::Tensor x_fp32 = x;
-    torch::Tensor k_fp32 = kernel;
+  int B = x_f.size(0);
+  int IC = x_f.size(1);
+  int H = x_f.size(2);
+  int W = x_f.size(3);
+  int OC = out_channels;
+  int K = kernel_size;
 
-    if (original_dtype != torch::kFloat) {
-        x_fp32 = x.to(torch::kFloat);
-    }
-    if (kernel.scalar_type() != torch::kFloat) {
-        k_fp32 = kernel.to(torch::kFloat);
-    }
+  TORCH_CHECK(IC == in_channels, "in_channels mismatch");
+  TORCH_CHECK(k_f.size(0) == out_channels, "kernel out_channels mismatch");
+  TORCH_CHECK(k_f.size(1) == in_channels, "kernel in_channels mismatch");
+  TORCH_CHECK(k_f.size(2) == kernel_size && k_f.size(3) == kernel_size,
+              "kernel_size mismatch");
 
-    int batch = (int)x_fp32.size(0);
-    int H = (int)x_fp32.size(2);
-    int W = (int)x_fp32.size(3);
-    int K = kernel_size;
+  int OH = H + 2 * padding - dilation * (K - 1);
+  int OW = W + 2 * padding - dilation * (K - 1);
+  TORCH_CHECK(OH > 0 && OW > 0, "invalid output shape");
 
-    int H_out = (H + 2 * padding - dilation * (K - 1));
-    int W_out = (W + 2 * padding - dilation * (K - 1));
+  auto out = torch::empty({B, OC, OH, OW}, x_f.options().dtype(torch::kFloat));
 
-    auto output_fp32 = torch::empty(
-        {(int64_t)batch, (int64_t)out_channels,
-         (int64_t)H_out, (int64_t)W_out},
-        x_fp32.options());
+  int w_tiles = (OW + CONV_TILE_W - 1) / CONV_TILE_W;
+  long long total_tiles = (long long)B * OC * OH * w_tiles;
 
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t dim = {256, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
-    dilated_conv2d_kernel<<<dim, ktype, queue>>>(
-        x_fp32.data_ptr<float>(),
-        k_fp32.data_ptr<float>(),
-        output_fp32.data_ptr<float>(),
-        batch, in_channels, out_channels, H, W,
-        K, dilation, padding,
-        H_out, W_out);
+  dilated_conv2d_float_kernel<<<dim, ktype, queue>>>(
+      x_f.data_ptr<float>(),
+      k_f.data_ptr<float>(),
+      out.data_ptr<float>(),
+      B,
+      IC,
+      OC,
+      H,
+      W,
+      K,
+      dilation,
+      padding,
+      OH,
+      OW,
+      total_tiles);
 
-    if (original_dtype != torch::kFloat) {
-        return output_fp32.to(original_dtype);
-    }
-
-    return output_fp32;
+  return out;
 }
