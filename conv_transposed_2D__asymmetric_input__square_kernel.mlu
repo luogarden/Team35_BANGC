@@ -3,8 +3,78 @@
 #include <cnrt.h>
 
 #define TASK_NUM 16
+#define ROW_BUF 1024
 
-__mlu_entry__ void conv_transpose2d_kernel(
+__mlu_entry__ void conv_transpose2d_fast_kernel(
+    float *x,
+    float *kernel,
+    float *output,
+    int batch,
+    int in_channels,
+    int out_channels,
+    int height_in,
+    int width_in,
+    int height_out,
+    int width_out) {
+
+    int in_hw = height_in * width_in;
+    int out_hw = height_out * width_out;
+    int total_rows = batch * out_channels * height_out;
+    int width_vec = (width_in + 63) & ~63;
+    int out_vec = (width_out + 63) & ~63;
+
+    __nram__ float out_buf[ROW_BUF];
+    __nram__ float in_buf[ROW_BUF];
+    __nram__ float tmp_buf[ROW_BUF];
+
+    for (int row_idx = taskId; row_idx < total_rows; row_idx += taskDim) {
+        int out_h = row_idx % height_out;
+        int tmp = row_idx / height_out;
+        int out_c = tmp % out_channels;
+        int b = tmp / out_channels;
+
+        __bang_write_value(out_buf, out_vec, 0.0f);
+
+        for (int in_c = 0; in_c < in_channels; ++in_c) {
+            int x_batch_base = (b * in_channels + in_c) * in_hw;
+            int k_base = (in_c * out_channels + out_c) * 9;
+
+            for (int kh = 0; kh < 3; ++kh) {
+                int in_h = out_h - kh;
+                if (in_h < 0 || in_h >= height_in) {
+                    continue;
+                }
+
+                __memcpy(in_buf,
+                         x + x_batch_base + in_h * width_in,
+                         width_in * sizeof(float), GDRAM2NRAM);
+                for (int i = width_in; i < width_vec; ++i) {
+                    in_buf[i] = 0.0f;
+                }
+
+                float k0 = kernel[k_base + kh * 3];
+                float k1 = kernel[k_base + kh * 3 + 1];
+                float k2 = kernel[k_base + kh * 3 + 2];
+
+                __bang_mul_scalar(tmp_buf, in_buf, k0, width_vec);
+                __bang_add(out_buf, out_buf, tmp_buf, width_vec);
+
+                __bang_mul_scalar(tmp_buf, in_buf, k1, width_vec);
+                __bang_add(out_buf + 1, out_buf + 1, tmp_buf, width_vec);
+
+                __bang_mul_scalar(tmp_buf, in_buf, k2, width_vec);
+                __bang_add(out_buf + 2, out_buf + 2, tmp_buf, width_vec);
+            }
+        }
+
+        int out_offset = (b * out_channels + out_c) * out_hw
+                         + out_h * width_out;
+        __memcpy(output + out_offset, out_buf,
+                 width_out * sizeof(float), NRAM2GDRAM);
+    }
+}
+
+__mlu_entry__ void conv_transpose2d_generic_kernel(
     float *x,
     float *kernel,
     float *output,
@@ -135,21 +205,40 @@ torch::Tensor bang_func(
     cnrtDim3_t dim = {TASK_NUM, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    conv_transpose2d_kernel<<<dim, ktype, queue>>>(
-        x_fp32.data_ptr<float>(),
-        kernel_fp32.data_ptr<float>(),
-        output_fp32.data_ptr<float>(),
-        batch,
-        in_channels,
-        out_channels,
-        height_in,
-        width_in,
-        kernel_size,
-        stride,
-        padding,
-        groups,
-        height_out,
-        width_out);
+    if (kernel_size == 3 &&
+        stride == 1 &&
+        padding == 0 &&
+        output_padding == 0 &&
+        groups == 1 &&
+        width_out <= ROW_BUF - 64) {
+        conv_transpose2d_fast_kernel<<<dim, ktype, queue>>>(
+            x_fp32.data_ptr<float>(),
+            kernel_fp32.data_ptr<float>(),
+            output_fp32.data_ptr<float>(),
+            batch,
+            in_channels,
+            out_channels,
+            height_in,
+            width_in,
+            height_out,
+            width_out);
+    } else {
+        conv_transpose2d_generic_kernel<<<dim, ktype, queue>>>(
+            x_fp32.data_ptr<float>(),
+            kernel_fp32.data_ptr<float>(),
+            output_fp32.data_ptr<float>(),
+            batch,
+            in_channels,
+            out_channels,
+            height_in,
+            width_in,
+            kernel_size,
+            stride,
+            padding,
+            groups,
+            height_out,
+            width_out);
+    }
 
     if (original_dtype != torch::kFloat) {
         return output_fp32.to(original_dtype);
