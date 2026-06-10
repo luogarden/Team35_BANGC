@@ -1,226 +1,105 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
+#include <cmath>
 
-#define CHUNK_SIZE 4096
+#define DOT_CHUNK 1024
+#define REDUCE_GROUP 32
 
-
-static inline float nram_exp(float x) {
-    const float inv_ln2 = 1.44269504088896341f;
-    const float ln2_hi = 0.693359375f;
-    const float ln2_lo = -0.00021217204052209854f;
-    union { float f; unsigned int u; } bits;
-    if (x < -87.3f) return 0.0f;
-    float kf = x * inv_ln2;
-    int k = (int)(kf + (kf >= 0.0f ? 0.5f : -0.5f));
-    float r = x - (float)k * ln2_hi - (float)k * ln2_lo;
-    float p = 1.0f + r * (1.0f + r * (0.5f +
-              r * (0.16666667163372039795f +
-              r * (0.04166668280959129333f +
-              r * (0.00833333097338676453f +
-              r * (0.00138889296869188547f +
-              r * (0.00019841069537773788f +
-              r * 0.000024793375991914592f)))))));
-    bits.u = (unsigned int)(k + 127) << 23;
-    return p * bits.f;
-}
-
-static inline float nram_sigmoid(float x) {
-    return 1.0f / (1.0f + nram_exp(-x));
-}
-
-
-__mlu_entry__ void gru_kernel(
-    const float *x,
-    const float *W_ih_l0,
-    const float *W_hh_l0,
-    const float *b_ih_l0,
-    const float *b_hh_l0,
-    const float *W_ih_l1,
-    const float *W_hh_l1,
-    const float *b_ih_l1,
-    const float *b_hh_l1,
-    float *inter_out,
-    float *final_out,
+__mlu_entry__ void gru_cell_kernel(
+    const float *x_t,
+    const float *h_prev,
+    const float *w_ih,
+    const float *w_hh,
+    const float *b_ih,
+    const float *b_hh,
+    float *h_cur,
+    float *layer_out,
     int B,
-    int seq,
-    int IS,
-    int H) {
+    int seq_len,
+    int in_dim,
+    int H,
+    int t_step) {
 
-    int _3H = 3 * H;
-    __nram__ float nram_buf[CHUNK_SIZE];
-    __nram__ float nram_gate[CHUNK_SIZE];
+  int total = B * H;
+  __nram__ float nram_a[DOT_CHUNK];
+  __nram__ float nram_b[DOT_CHUNK];
+  __nram__ float nram_prod[DOT_CHUNK];
+  __nram__ float nram_red[DOT_CHUNK];
 
-    int buf_wt_start = 2 * H;                 // 1024
-    int buf_wt_space = CHUNK_SIZE - 2 * H;    // 3072
-    int in_chunk0 = buf_wt_space / IS;        // 3072/256 = 12
-    int hh_chunk0 = buf_wt_space / H;         // 3072/512 = 6
-    int in_chunk1 = buf_wt_space / H;         // 3072/512 = 6
-    int hh_chunk1 = buf_wt_space / H;         // 3072/512 = 6
+  for (int idx = taskId; idx < total; idx += taskDim) {
+    int b = idx / H;
+    int h = idx - b * H;
 
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t per_core = B / core_num;
-    uint32_t b_start = core_id * per_core;
-    uint32_t b_end = b_start + per_core;
+    float gi[3];
+    float gh[3];
 
-    // ========== Layer 0 ==========
-    for (int b = b_start; b < b_end; b++) {
-        const float *x_b = x + (long long)b * seq * IS;
-        float *out_b = inter_out + (long long)b * seq * H;
+    // ---- Gate 0~2: x_t @ W_ih + b_ih ----
+    for (int gate = 0; gate < 3; ++gate) {
+      int row = gate * H + h;
 
-        // h_prev at nram_buf[0..H-1], init to 0
-        for (int d = 0; d < H; d++) nram_buf[d] = 0.0f;
+      float sum_i = b_ih[row];
+      const float *in_p = x_t + (long long)b * in_dim;
+      const float *wi_p = w_ih + (long long)row * in_dim;
 
-        for (int t = 0; t < seq; t++) {
-            // Load x_t into nram_buf[H..H+IS-1]
-            const float *x_t = x_b + (long long)t * IS;
-            __memcpy(nram_buf + H, x_t, IS * sizeof(float), GDRAM2NRAM);
+      for (int start = 0; start < in_dim; start += DOT_CHUNK) {
+        int len = in_dim - start;
+        if (len > DOT_CHUNK) len = DOT_CHUNK;
+        int alen = (len + 63) & ~63;
 
-            // ---- Compute gi = x_t @ W_ih_l0^T + b_ih_l0 ----
-            for (int oc = 0; oc < _3H; oc += in_chunk0) {
-                int rows = in_chunk0;
-                if (oc + rows > _3H) rows = _3H - oc;
+        __bang_write_value(nram_a, alen, 0.0f);
+        __bang_write_value(nram_b, alen, 0.0f);
+        __memcpy(nram_a, in_p + start, len * sizeof(float), GDRAM2NRAM);
+        __memcpy(nram_b, wi_p + start, len * sizeof(float), GDRAM2NRAM);
+        __bang_mul(nram_prod, nram_a, nram_b, alen);
+        __bang_reduce_sum(nram_red, nram_prod, alen);
 
-                __memcpy(nram_buf + buf_wt_start,
-                         W_ih_l0 + (long long)oc * IS,
-                         rows * IS * sizeof(float),
-                         GDRAM2NRAM);
-
-                for (int o = 0; o < rows; o++) {
-                    float sum = b_ih_l0[oc + o];
-                    for (int i = 0; i < IS; i++) {
-                        sum += nram_buf[H + i]
-                             * nram_buf[buf_wt_start + o * IS + i];
-                    }
-                    nram_gate[oc + o] = sum;
-                }
-            }
-
-            // ---- Compute gh = h_prev @ W_hh_l0^T + b_hh_l0 ----
-            for (int oc = 0; oc < _3H; oc += hh_chunk0) {
-                int rows = hh_chunk0;
-                if (oc + rows > _3H) rows = _3H - oc;
-
-                __memcpy(nram_buf + buf_wt_start,
-                         W_hh_l0 + (long long)oc * H,
-                         rows * H * sizeof(float),
-                         GDRAM2NRAM);
-
-                for (int o = 0; o < rows; o++) {
-                    float sum = b_hh_l0[oc + o];
-                    for (int i = 0; i < H; i++) {
-                        sum += nram_buf[i]
-                             * nram_buf[buf_wt_start + o * H + i];
-                    }
-                    nram_gate[_3H + oc + o] = sum;
-                }
-            }
-
-            // ---- Activations ----
-            // gi = nram_gate[0.._3H-1], gh = nram_gate[_3H..2*_3H-1]
-            // h_prev = nram_buf[0..H-1], h_new → nram_buf[H..2H-1]
-            float *p_gi = nram_gate;
-            float *p_gh = nram_gate + _3H;
-            float *p_hp = nram_buf;
-
-            for (int d = 0; d < H; d++) {
-                float gr = p_gi[d] + p_gh[d];
-                float gz = p_gi[H + d] + p_gh[H + d];
-                float gn_in = p_gi[2 * H + d]
-                            + nram_sigmoid(gr) * p_gh[2 * H + d];
-                float r  = nram_sigmoid(gr);
-                float z  = nram_sigmoid(gz);
-                float n  = nram_sigmoid(2.0f * gn_in);
-                n = 2.0f * n - 1.0f;  // tanh = 2*sigmoid(2x)-1
-                nram_buf[H + d] = (1.0f - z) * n + z * p_hp[d];
-            }
-
-            // Write h_new to GDRAM output
-            __memcpy(out_b + (long long)t * H,
-                     nram_buf + H,
-                     H * sizeof(float), NRAM2GDRAM);
-
-            // h_prev = h_new for next timestep
-            for (int d = 0; d < H; d++) nram_buf[d] = nram_buf[H + d];
+        int rlen = alen / REDUCE_GROUP;
+        for (int i = 0; i < rlen; ++i) {
+          sum_i += nram_red[i * REDUCE_GROUP];
         }
+      }
+      gi[gate] = sum_i;
+
+      // ---- Gate 0~2: h_prev @ W_hh + b_hh ----
+      float sum_h = b_hh[row];
+      const float *hp_p = h_prev + (long long)b * H;
+      const float *wh_p = w_hh + (long long)row * H;
+
+      for (int start = 0; start < H; start += DOT_CHUNK) {
+        int len = H - start;
+        if (len > DOT_CHUNK) len = DOT_CHUNK;
+        int alen = (len + 63) & ~63;
+
+        __bang_write_value(nram_a, alen, 0.0f);
+        __bang_write_value(nram_b, alen, 0.0f);
+        __memcpy(nram_a, hp_p + start, len * sizeof(float), GDRAM2NRAM);
+        __memcpy(nram_b, wh_p + start, len * sizeof(float), GDRAM2NRAM);
+        __bang_mul(nram_prod, nram_a, nram_b, alen);
+        __bang_reduce_sum(nram_red, nram_prod, alen);
+
+        int rlen = alen / REDUCE_GROUP;
+        for (int i = 0; i < rlen; ++i) {
+          sum_h += nram_red[i * REDUCE_GROUP];
+        }
+      }
+      gh[gate] = sum_h;
     }
 
-    // ========== Layer 1 ==========
-    for (int b = b_start; b < b_end; b++) {
-        const float *x_b = inter_out + (long long)b * seq * H;
-        float *out_b = final_out + (long long)b * seq * H;
+    // ---- Activations ----
+    float gr = gi[0] + gh[0];
+    float gz = gi[1] + gh[1];
 
-        for (int d = 0; d < H; d++) nram_buf[d] = 0.0f;
+    float r = 1.0f / (1.0f + expf(-gr));
+    float z = 1.0f / (1.0f + expf(-gz));
+    float n = tanhf(gi[2] + r * gh[2]);
 
-        for (int t = 0; t < seq; t++) {
-            const float *x_t = x_b + (long long)t * H;
-            __memcpy(nram_buf + H, x_t, H * sizeof(float), GDRAM2NRAM);
+    float prev = h_prev[(long long)b * H + h];
+    float val = (1.0f - z) * n + z * prev;
 
-            // ---- Compute gi = x_t @ W_ih_l1^T + b_ih_l1 ----
-            for (int oc = 0; oc < _3H; oc += in_chunk1) {
-                int rows = in_chunk1;
-                if (oc + rows > _3H) rows = _3H - oc;
-
-                __memcpy(nram_buf + buf_wt_start,
-                         W_ih_l1 + (long long)oc * H,
-                         rows * H * sizeof(float),
-                         GDRAM2NRAM);
-
-                for (int o = 0; o < rows; o++) {
-                    float sum = b_ih_l1[oc + o];
-                    for (int i = 0; i < H; i++) {
-                        sum += nram_buf[H + i]
-                             * nram_buf[buf_wt_start + o * H + i];
-                    }
-                    nram_gate[oc + o] = sum;
-                }
-            }
-
-            // ---- Compute gh = h_prev @ W_hh_l1^T + b_hh_l1 ----
-            for (int oc = 0; oc < _3H; oc += hh_chunk1) {
-                int rows = hh_chunk1;
-                if (oc + rows > _3H) rows = _3H - oc;
-
-                __memcpy(nram_buf + buf_wt_start,
-                         W_hh_l1 + (long long)oc * H,
-                         rows * H * sizeof(float),
-                         GDRAM2NRAM);
-
-                for (int o = 0; o < rows; o++) {
-                    float sum = b_hh_l1[oc + o];
-                    for (int i = 0; i < H; i++) {
-                        sum += nram_buf[i]
-                             * nram_buf[buf_wt_start + o * H + i];
-                    }
-                    nram_gate[_3H + oc + o] = sum;
-                }
-            }
-
-            // ---- Activations ----
-            float *p_gi = nram_gate;
-            float *p_gh = nram_gate + _3H;
-            float *p_hp = nram_buf;
-
-            for (int d = 0; d < H; d++) {
-                float gr = p_gi[d] + p_gh[d];
-                float gz = p_gi[H + d] + p_gh[H + d];
-                float gn_in = p_gi[2 * H + d]
-                            + nram_sigmoid(gr) * p_gh[2 * H + d];
-                float r  = nram_sigmoid(gr);
-                float z  = nram_sigmoid(gz);
-                float n  = nram_sigmoid(2.0f * gn_in);
-                n = 2.0f * n - 1.0f;
-                nram_buf[H + d] = (1.0f - z) * n + z * p_hp[d];
-            }
-
-            __memcpy(out_b + (long long)t * H,
-                     nram_buf + H,
-                     H * sizeof(float), NRAM2GDRAM);
-
-            for (int d = 0; d < H; d++) nram_buf[d] = nram_buf[H + d];
-        }
-    }
+    h_cur[(long long)b * H + h] = val;
+    layer_out[((long long)b * seq_len + t_step) * H + h] = val;
+  }
 }
 
 
@@ -230,55 +109,79 @@ torch::Tensor bang_func(
     int hidden_size,
     int num_layers) {
 
-    TORCH_CHECK(x.dim() == 3, "x must be 3D [batch, seq_len, input_size]");
-    TORCH_CHECK(num_layers >= 1, "num_layers must be >= 1");
+  TORCH_CHECK(x.dim() == 3, "x must be 3D [batch, seq_len, input_size]");
+  TORCH_CHECK(num_layers == 2, "this implementation supports num_layers == 2");
 
-    auto x_f = x.contiguous();
-    if (x_f.scalar_type() != torch::kFloat) {
-        x_f = x_f.to(torch::kFloat);
-    }
-    x_f = x_f.contiguous();
+  auto x_f = x.contiguous();
+  if (x_f.scalar_type() != torch::kFloat) {
+    x_f = x_f.to(torch::kFloat);
+  }
+  x_f = x_f.contiguous();
 
-    int B = (int)x_f.size(0);
-    int seq = (int)x_f.size(1);
-    int IS = input_size;
-    int H = hidden_size;
+  int B = (int)x_f.size(0);
+  int seq = (int)x_f.size(1);
+  int IS = input_size;
+  int H = hidden_size;
 
-    auto opts = x_f.options().dtype(torch::kFloat);
+  auto opts = x_f.options().dtype(torch::kFloat);
 
-    auto W_ih_l0 = torch::empty({3 * H, IS}, opts);
-    auto W_hh_l0 = torch::empty({3 * H, H}, opts);
-    auto b_ih_l0 = torch::empty({3 * H}, opts);
-    auto b_hh_l0 = torch::empty({3 * H}, opts);
+  auto w_ih0 = torch::empty({3 * H, IS}, opts);
+  auto w_hh0 = torch::empty({3 * H, H}, opts);
+  auto b_ih0 = torch::empty({3 * H}, opts);
+  auto b_hh0 = torch::empty({3 * H}, opts);
 
-    auto W_ih_l1 = torch::empty({3 * H, H}, opts);
-    auto W_hh_l1 = torch::empty({3 * H, H}, opts);
-    auto b_ih_l1 = torch::empty({3 * H}, opts);
-    auto b_hh_l1 = torch::empty({3 * H}, opts);
+  auto w_ih1 = torch::empty({3 * H, H}, opts);
+  auto w_hh1 = torch::empty({3 * H, H}, opts);
+  auto b_ih1 = torch::empty({3 * H}, opts);
+  auto b_hh1 = torch::empty({3 * H}, opts);
 
-    auto inter_out = torch::empty({B, seq, H}, opts);
-    auto out = torch::empty({B, seq, H}, opts);
+  auto layer0_out = torch::empty({B, seq, H}, opts);
+  auto output = torch::empty({B, seq, H}, opts);
 
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+  auto prev0 = torch::zeros({B, H}, opts);
+  auto curr0 = torch::empty({B, H}, opts);
+  auto prev1 = torch::zeros({B, H}, opts);
+  auto curr1 = torch::empty({B, H}, opts);
 
-    gru_kernel<<<dim, ktype, queue>>>(
+  cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+  cnrtDim3_t dim = {256, 1, 1};
+  cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+  for (int t = 0; t < seq; ++t) {
+    gru_cell_kernel<<<dim, ktype, queue>>>(
         x_f.data_ptr<float>(),
-        W_ih_l0.data_ptr<float>(),
-        W_hh_l0.data_ptr<float>(),
-        b_ih_l0.data_ptr<float>(),
-        b_hh_l0.data_ptr<float>(),
-        W_ih_l1.data_ptr<float>(),
-        W_hh_l1.data_ptr<float>(),
-        b_ih_l1.data_ptr<float>(),
-        b_hh_l1.data_ptr<float>(),
-        inter_out.data_ptr<float>(),
-        out.data_ptr<float>(),
+        prev0.data_ptr<float>(),
+        w_ih0.data_ptr<float>(),
+        w_hh0.data_ptr<float>(),
+        b_ih0.data_ptr<float>(),
+        b_hh0.data_ptr<float>(),
+        curr0.data_ptr<float>(),
+        layer0_out.data_ptr<float>(),
         B,
         seq,
         IS,
-        H);
+        H,
+        t);
+    std::swap(prev0, curr0);
+  }
 
-    return out;
+  for (int t = 0; t < seq; ++t) {
+    gru_cell_kernel<<<dim, ktype, queue>>>(
+        layer0_out.data_ptr<float>(),
+        prev1.data_ptr<float>(),
+        w_ih1.data_ptr<float>(),
+        w_hh1.data_ptr<float>(),
+        b_ih1.data_ptr<float>(),
+        b_hh1.data_ptr<float>(),
+        curr1.data_ptr<float>(),
+        output.data_ptr<float>(),
+        B,
+        seq,
+        H,
+        H,
+        t);
+    std::swap(prev1, curr1);
+  }
+
+  return output;
 }
