@@ -22,8 +22,13 @@ __mlu_entry__ void dilated_conv2d_float_kernel(
     long long total_tiles) {
 
   __nram__ float nram_x[CONV_BUF_W];
-  __nram__ float nram_w[CONV_BUF_W];
+  __nram__ float nram_tmp[CONV_BUF_W];
+  __nram__ float nram_y[CONV_BUF_W];
   __nram__ float nram_acc[CONV_BUF_W];
+  __nram__ float nram_comp[CONV_BUF_W];
+  __nram__ float nram_zero[CONV_BUF_W];
+
+  __bang_write_value(nram_zero, CONV_BUF_W, 0.0f);
 
   int w_tiles = (OW + CONV_TILE_W - 1) / CONV_TILE_W;
 
@@ -47,6 +52,7 @@ __mlu_entry__ void dilated_conv2d_float_kernel(
       len = CONV_TILE_W;
     }
     __bang_write_value(nram_acc, CONV_BUF_W, 0.0f);
+    __bang_write_value(nram_comp, CONV_BUF_W, 0.0f);
 
     for (int ic = 0; ic < IC; ++ic) {
       for (int kh = 0; kh < K; ++kh) {
@@ -91,11 +97,36 @@ __mlu_entry__ void dilated_conv2d_float_kernel(
               kw;
           float w_val = kernel[w_idx];
 
-          __bang_write_value(nram_w, aligned_vlen, w_val);
-          __bang_mac(
+          __bang_mul_scalar(nram_tmp, nram_x, w_val, aligned_vlen);
+
+          __bang_sub(
+              nram_y,
+              nram_tmp,
+              nram_comp + valid_start,
+              aligned_vlen);
+
+          __bang_add(
+              nram_tmp,
               nram_acc + valid_start,
-              nram_x,
-              nram_w,
+              nram_y,
+              aligned_vlen);
+
+          __bang_sub(
+              nram_comp + valid_start,
+              nram_tmp,
+              nram_acc + valid_start,
+              aligned_vlen);
+
+          __bang_sub(
+              nram_comp + valid_start,
+              nram_comp + valid_start,
+              nram_y,
+              aligned_vlen);
+
+          __bang_add(
+              nram_acc + valid_start,
+              nram_tmp,
+              nram_zero,
               aligned_vlen);
         }
       }
