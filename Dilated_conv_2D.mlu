@@ -21,76 +21,95 @@ __mlu_entry__ void dilated_conv2d_kernel(
 
     int spatial = H * W;
     int out_spatial = H_out * W_out;
-    int total_out = batch * out_channels * out_spatial;
-    int kernel_area = K * K;
+    int col_size = in_channels * K * K;
+    int num_spatial = batch * out_spatial;
+    const int TILE_OC = 6;
+
+    __nram__ float nram_col[CHUNK_SIZE];
+    __nram__ float nram_kern[CHUNK_SIZE];
 
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
-    uint32_t per_core = total_out / core_num;
-    uint32_t rem = total_out % core_num;
+    uint32_t per_core = num_spatial / core_num;
+    uint32_t rem = num_spatial % core_num;
     uint32_t start = core_id * per_core +
                      (core_id < rem ? core_id : rem);
     uint32_t count = per_core +
                      (core_id < rem ? 1 : 0);
 
-    __nram__ float nram_kernel[CHUNK_SIZE];
-    __nram__ float nram_row[CHUNK_SIZE];
+    for (int oc_start = 0; oc_start < out_channels; oc_start += TILE_OC) {
+        int cur_tile = TILE_OC;
+        if (oc_start + TILE_OC > out_channels) {
+            cur_tile = out_channels - oc_start;
+        }
 
-    for (uint32_t idx = 0; idx < count; idx++) {
-        uint32_t flat = start + idx;
-        int w_out = flat % W_out;
-        int tmp = flat / W_out;
-        int h_out = tmp % H_out;
-        tmp /= H_out;
-        int oc = tmp % out_channels;
-        int b = tmp / out_channels;
+        __memcpy(nram_kern,
+                 kernel + oc_start * col_size,
+                 cur_tile * col_size * sizeof(float),
+                 GDRAM2NRAM);
 
-        int in_h_start = h_out - padding;
-        int in_w_start = w_out - padding;
+        for (uint32_t idx = 0; idx < count; idx++) {
+            uint32_t flat = start + idx;
+            int w_out = flat % W_out;
+            int tmp = flat / W_out;
+            int h_out = tmp % H_out;
+            int b = tmp / H_out;
 
-        float sum = 0.0f;
+            int in_h_start = h_out - padding;
+            int in_w_start = w_out - padding;
 
-        for (int ic = 0; ic < in_channels; ic++) {
-            __memcpy(nram_kernel,
-                     kernel + (oc * in_channels + ic) * kernel_area,
-                     kernel_area * sizeof(float), GDRAM2NRAM);
+            int col_idx = 0;
 
-            int plane_offset = (b * in_channels + ic) * spatial;
+            for (int ic = 0; ic < in_channels; ic++) {
+                int plane_offset = (b * in_channels + ic) * spatial;
 
-            for (int kh = 0; kh < K; kh++) {
-                int h_idx = in_h_start + kh * dilation;
+                for (int kh = 0; kh < K; kh++) {
+                    int h_idx = in_h_start + kh * dilation;
 
-                if (h_idx >= 0 && h_idx < H &&
-                    in_w_start >= 0 && in_w_start + K * dilation <= W) {
-                    __memcpy(nram_row,
-                             x + plane_offset + h_idx * W + in_w_start,
-                             K * dilation * sizeof(float), GDRAM2NRAM);
-                    for (int kw = 0; kw < K; kw++) {
-                        sum += nram_row[kw * dilation]
-                               * nram_kernel[kh * K + kw];
-                    }
-                } else {
-                    for (int kw = 0; kw < K; kw++) {
-                        int w_idx = in_w_start + kw * dilation;
-                        float val = 0.0f;
-                        if (h_idx >= 0 && h_idx < H &&
-                            w_idx >= 0 && w_idx < W) {
-                            __memcpy(nram_row,
-                                     x + plane_offset + h_idx * W + w_idx,
-                                     sizeof(float), GDRAM2NRAM);
-                            val = nram_row[0];
+                    if (h_idx >= 0 && h_idx < H &&
+                        in_w_start >= 0 && in_w_start + K * dilation <= W) {
+                        __memcpy(nram_col + col_idx,
+                                 x + plane_offset + h_idx * W + in_w_start,
+                                 K * dilation * sizeof(float),
+                                 GDRAM2NRAM);
+                        for (int kw = 0; kw < K; kw++) {
+                            nram_col[col_idx + kw] =
+                                nram_col[col_idx + kw * dilation];
                         }
-                        sum += val * nram_kernel[kh * K + kw];
+                        col_idx += K;
+                    } else {
+                        for (int kw = 0; kw < K; kw++) {
+                            int w_idx = in_w_start + kw * dilation;
+                            float val = 0.0f;
+                            if (h_idx >= 0 && h_idx < H &&
+                                w_idx >= 0 && w_idx < W) {
+                                __memcpy(nram_col + col_idx,
+                                         x + plane_offset + h_idx * W + w_idx,
+                                         sizeof(float), GDRAM2NRAM);
+                                val = nram_col[col_idx];
+                            }
+                            nram_col[col_idx] = val;
+                            col_idx++;
+                        }
                     }
                 }
             }
-        }
 
-        nram_kernel[0] = sum;
-        int out_offset = (b * out_channels + oc) * out_spatial
-                         + h_out * W_out + w_out;
-        __memcpy(output + out_offset, nram_kernel,
-                 sizeof(float), NRAM2GDRAM);
+            int out_base = (b * out_channels * out_spatial)
+                           + h_out * W_out + w_out;
+
+            for (int t = 0; t < cur_tile; t++) {
+                float sum = 0.0f;
+                for (int k = 0; k < col_size; k++) {
+                    sum += nram_col[k] * nram_kern[t * col_size + k];
+                }
+                int oc = oc_start + t;
+                nram_col[col_size] = sum;
+                __memcpy(output + out_base + oc * out_spatial,
+                         nram_col + col_size,
+                         sizeof(float), NRAM2GDRAM);
+            }
+        }
     }
 }
 
