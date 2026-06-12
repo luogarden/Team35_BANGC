@@ -2,106 +2,131 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 #include <cmath>
+#include <utility>
 
-#define DOT_CHUNK 1024
-#define REDUCE_GROUP 32
+#define GRU_DOT_CHUNK 1024
+#define FLOAT_REDUCE_GROUP 32
 
-__mlu_entry__ void gru_cell_kernel(
-    const float *x_t,
-    const float *h_prev,
-    const float *w_ih,
-    const float *w_hh,
-    const float *b_ih,
-    const float *b_hh,
-    float *h_cur,
+__mlu_entry__ void gru_step_float_kernel(
+    const float *input,
+    const float *prev_h,
+    const float *weight_ih,
+    const float *weight_hh,
+    const float *bias_ih,
+    const float *bias_hh,
+    float *curr_h,
     float *layer_out,
     int B,
     int seq_len,
-    int in_dim,
-    int H,
+    int input_dim,
+    int hidden_size,
     int t_step) {
 
-  int total = B * H;
-  __nram__ float nram_a[DOT_CHUNK];
-  __nram__ float nram_b[DOT_CHUNK];
-  __nram__ float nram_prod[DOT_CHUNK];
-  __nram__ float nram_red[DOT_CHUNK];
+  __nram__ float nram_a[GRU_DOT_CHUNK];
+  __nram__ float nram_b[GRU_DOT_CHUNK];
+  __nram__ float nram_prod[GRU_DOT_CHUNK];
+  __nram__ float nram_reduce[GRU_DOT_CHUNK];
+
+  int total = B * hidden_size;
 
   for (int idx = taskId; idx < total; idx += taskDim) {
-    int b = idx / H;
-    int h = idx - b * H;
+    int b = idx / hidden_size;
+    int h = idx - b * hidden_size;
 
-    float gi[3];
-    float gh[3];
+    float gate_ih[3];
+    float gate_hh[3];
 
-    // ---- Gate 0~2: x_t @ W_ih + b_ih ----
     for (int gate = 0; gate < 3; ++gate) {
-      int row = gate * H + h;
+      int row = gate * hidden_size + h;
 
-      float sum_i = b_ih[row];
-      const float *in_p = x_t + (long long)b * in_dim;
-      const float *wi_p = w_ih + (long long)row * in_dim;
+      float sum_i = bias_ih[row];
+      const float *input_ptr =
+          input + ((long long)b * seq_len + t_step) * input_dim;
+      const float *w_i = weight_ih + (long long)row * input_dim;
 
-      for (int start = 0; start < in_dim; start += DOT_CHUNK) {
-        int len = in_dim - start;
-        if (len > DOT_CHUNK) len = DOT_CHUNK;
-        int alen = (len + 63) & ~63;
+      for (int start = 0; start < input_dim; start += GRU_DOT_CHUNK) {
+        int len = input_dim - start;
+        if (len > GRU_DOT_CHUNK) {
+          len = GRU_DOT_CHUNK;
+        }
+        int aligned_len = (len + 63) & ~63;
 
-        __bang_write_value(nram_a, alen, 0.0f);
-        __bang_write_value(nram_b, alen, 0.0f);
-        __memcpy(nram_a, in_p + start, len * sizeof(float), GDRAM2NRAM);
-        __memcpy(nram_b, wi_p + start, len * sizeof(float), GDRAM2NRAM);
-        __bang_mul(nram_prod, nram_a, nram_b, alen);
-        __bang_reduce_sum(nram_red, nram_prod, alen);
+        __bang_write_value(nram_a, aligned_len, 0.0f);
+        __bang_write_value(nram_b, aligned_len, 0.0f);
+        __memcpy(nram_a, input_ptr + start, len * sizeof(float), GDRAM2NRAM);
+        __memcpy(nram_b, w_i + start, len * sizeof(float), GDRAM2NRAM);
+        __bang_mul(nram_prod, nram_a, nram_b, aligned_len);
+        __bang_reduce_sum(nram_reduce, nram_prod, aligned_len);
 
-        int rlen = alen / REDUCE_GROUP;
-        for (int i = 0; i < rlen; ++i) {
-          sum_i += nram_red[i * REDUCE_GROUP];
+        int reduced_len = aligned_len / FLOAT_REDUCE_GROUP;
+        for (int i = 0; i < reduced_len; ++i) {
+          sum_i += nram_reduce[i * FLOAT_REDUCE_GROUP];
         }
       }
-      gi[gate] = sum_i;
+      gate_ih[gate] = sum_i;
 
-      // ---- Gate 0~2: h_prev @ W_hh + b_hh ----
-      float sum_h = b_hh[row];
-      const float *hp_p = h_prev + (long long)b * H;
-      const float *wh_p = w_hh + (long long)row * H;
+      float sum_h = bias_hh[row];
+      const float *prev_ptr = prev_h + (long long)b * hidden_size;
+      const float *w_h = weight_hh + (long long)row * hidden_size;
 
-      for (int start = 0; start < H; start += DOT_CHUNK) {
-        int len = H - start;
-        if (len > DOT_CHUNK) len = DOT_CHUNK;
-        int alen = (len + 63) & ~63;
+      for (int start = 0; start < hidden_size; start += GRU_DOT_CHUNK) {
+        int len = hidden_size - start;
+        if (len > GRU_DOT_CHUNK) {
+          len = GRU_DOT_CHUNK;
+        }
+        int aligned_len = (len + 63) & ~63;
 
-        __bang_write_value(nram_a, alen, 0.0f);
-        __bang_write_value(nram_b, alen, 0.0f);
-        __memcpy(nram_a, hp_p + start, len * sizeof(float), GDRAM2NRAM);
-        __memcpy(nram_b, wh_p + start, len * sizeof(float), GDRAM2NRAM);
-        __bang_mul(nram_prod, nram_a, nram_b, alen);
-        __bang_reduce_sum(nram_red, nram_prod, alen);
+        __bang_write_value(nram_a, aligned_len, 0.0f);
+        __bang_write_value(nram_b, aligned_len, 0.0f);
+        __memcpy(nram_a, prev_ptr + start, len * sizeof(float), GDRAM2NRAM);
+        __memcpy(nram_b, w_h + start, len * sizeof(float), GDRAM2NRAM);
+        __bang_mul(nram_prod, nram_a, nram_b, aligned_len);
+        __bang_reduce_sum(nram_reduce, nram_prod, aligned_len);
 
-        int rlen = alen / REDUCE_GROUP;
-        for (int i = 0; i < rlen; ++i) {
-          sum_h += nram_red[i * REDUCE_GROUP];
+        int reduced_len = aligned_len / FLOAT_REDUCE_GROUP;
+        for (int i = 0; i < reduced_len; ++i) {
+          sum_h += nram_reduce[i * FLOAT_REDUCE_GROUP];
         }
       }
-      gh[gate] = sum_h;
+      gate_hh[gate] = sum_h;
     }
 
-    // ---- Activations ----
-    float gr = gi[0] + gh[0];
-    float gz = gi[1] + gh[1];
+    float r_arg = gate_ih[0] + gate_hh[0];
+    float z_arg = gate_ih[1] + gate_hh[1];
 
-    float r = 1.0f / (1.0f + expf(-gr));
-    float z = 1.0f / (1.0f + expf(-gz));
-    float n = tanhf(gi[2] + r * gh[2]);
+    float r;
+    if (r_arg >= 0.0f) {
+      r = 1.0f / (1.0f + expf(-r_arg));
+    } else {
+      float e = expf(r_arg);
+      r = e / (1.0f + e);
+    }
 
-    float prev = h_prev[(long long)b * H + h];
-    float val = (1.0f - z) * n + z * prev;
+    float z;
+    if (z_arg >= 0.0f) {
+      z = 1.0f / (1.0f + expf(-z_arg));
+    } else {
+      float e = expf(z_arg);
+      z = e / (1.0f + e);
+    }
 
-    h_cur[(long long)b * H + h] = val;
-    layer_out[((long long)b * seq_len + t_step) * H + h] = val;
+    float n_arg = gate_ih[2] + r * gate_hh[2];
+    float n;
+    if (n_arg > 10.0f) {
+      n = 1.0f;
+    } else if (n_arg < -10.0f) {
+      n = -1.0f;
+    } else {
+      float e = expf(2.0f * n_arg);
+      n = (e - 1.0f) / (e + 1.0f);
+    }
+    float prev = prev_h[(long long)b * hidden_size + h];
+    float value = (1.0f - z) * n + z * prev;
+
+    curr_h[(long long)b * hidden_size + h] = value;
+    layer_out[((long long)b * seq_len + t_step) * hidden_size + h] = value;
   }
 }
-
 
 torch::Tensor bang_func(
     torch::Tensor x,
@@ -119,8 +144,14 @@ torch::Tensor bang_func(
 
   TORCH_CHECK(x.dim() == 3, "x must be 3D [batch, seq_len, input_size]");
   TORCH_CHECK(num_layers == 2, "this implementation supports num_layers == 2");
+  TORCH_CHECK(x.size(2) == input_size, "input_size mismatch");
 
   auto x_f = x.contiguous();
+  if (x_f.scalar_type() != torch::kFloat) {
+    x_f = x_f.to(torch::kFloat);
+  }
+  x_f = x_f.contiguous();
+
   auto w_ih0 = weight_ih_l0.contiguous();
   auto w_hh0 = weight_hh_l0.contiguous();
   auto b_ih0 = bias_ih_l0.contiguous();
@@ -130,9 +161,6 @@ torch::Tensor bang_func(
   auto b_ih1 = bias_ih_l1.contiguous();
   auto b_hh1 = bias_hh_l1.contiguous();
 
-  if (x_f.scalar_type() != torch::kFloat) {
-    x_f = x_f.to(torch::kFloat);
-  }
   if (w_ih0.scalar_type() != torch::kFloat) w_ih0 = w_ih0.to(torch::kFloat);
   if (w_hh0.scalar_type() != torch::kFloat) w_hh0 = w_hh0.to(torch::kFloat);
   if (b_ih0.scalar_type() != torch::kFloat) b_ih0 = b_ih0.to(torch::kFloat);
@@ -142,7 +170,6 @@ torch::Tensor bang_func(
   if (b_ih1.scalar_type() != torch::kFloat) b_ih1 = b_ih1.to(torch::kFloat);
   if (b_hh1.scalar_type() != torch::kFloat) b_hh1 = b_hh1.to(torch::kFloat);
 
-  x_f = x_f.contiguous();
   w_ih0 = w_ih0.contiguous();
   w_hh0 = w_hh0.contiguous();
   b_ih0 = b_ih0.contiguous();
@@ -152,27 +179,33 @@ torch::Tensor bang_func(
   b_ih1 = b_ih1.contiguous();
   b_hh1 = b_hh1.contiguous();
 
-  int B = (int)x_f.size(0);
-  int seq = (int)x_f.size(1);
-  int IS = input_size;
-  int H = hidden_size;
+  int B = x_f.size(0);
+  int seq_len = x_f.size(1);
+
+  TORCH_CHECK(w_ih0.size(0) == 3 * hidden_size && w_ih0.size(1) == input_size,
+              "weight_ih_l0 shape mismatch");
+  TORCH_CHECK(w_hh0.size(0) == 3 * hidden_size && w_hh0.size(1) == hidden_size,
+              "weight_hh_l0 shape mismatch");
+  TORCH_CHECK(w_ih1.size(0) == 3 * hidden_size && w_ih1.size(1) == hidden_size,
+              "weight_ih_l1 shape mismatch");
+  TORCH_CHECK(w_hh1.size(0) == 3 * hidden_size && w_hh1.size(1) == hidden_size,
+              "weight_hh_l1 shape mismatch");
 
   auto opts = x_f.options().dtype(torch::kFloat);
+  auto layer0_out = torch::empty({B, seq_len, hidden_size}, opts);
+  auto output = torch::empty({B, seq_len, hidden_size}, opts);
 
-  auto layer0_out = torch::empty({B, seq, H}, opts);
-  auto output = torch::empty({B, seq, H}, opts);
-
-  auto prev0 = torch::zeros({B, H}, opts);
-  auto curr0 = torch::empty({B, H}, opts);
-  auto prev1 = torch::zeros({B, H}, opts);
-  auto curr1 = torch::empty({B, H}, opts);
+  auto prev0 = torch::zeros({B, hidden_size}, opts);
+  auto curr0 = torch::empty({B, hidden_size}, opts);
+  auto prev1 = torch::zeros({B, hidden_size}, opts);
+  auto curr1 = torch::empty({B, hidden_size}, opts);
 
   cnrtQueue_t queue = torch_mlu::getCurMLUStream();
   cnrtDim3_t dim = {256, 1, 1};
   cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
-  for (int t = 0; t < seq; ++t) {
-    gru_cell_kernel<<<dim, ktype, queue>>>(
+  for (int t = 0; t < seq_len; ++t) {
+    gru_step_float_kernel<<<dim, ktype, queue>>>(
         x_f.data_ptr<float>(),
         prev0.data_ptr<float>(),
         w_ih0.data_ptr<float>(),
@@ -182,15 +215,15 @@ torch::Tensor bang_func(
         curr0.data_ptr<float>(),
         layer0_out.data_ptr<float>(),
         B,
-        seq,
-        IS,
-        H,
+        seq_len,
+        input_size,
+        hidden_size,
         t);
     std::swap(prev0, curr0);
   }
 
-  for (int t = 0; t < seq; ++t) {
-    gru_cell_kernel<<<dim, ktype, queue>>>(
+  for (int t = 0; t < seq_len; ++t) {
+    gru_step_float_kernel<<<dim, ktype, queue>>>(
         layer0_out.data_ptr<float>(),
         prev1.data_ptr<float>(),
         w_ih1.data_ptr<float>(),
@@ -200,12 +233,13 @@ torch::Tensor bang_func(
         curr1.data_ptr<float>(),
         output.data_ptr<float>(),
         B,
-        seq,
-        H,
-        H,
+        seq_len,
+        hidden_size,
+        hidden_size,
         t);
     std::swap(prev1, curr1);
   }
 
   return output;
 }
+
