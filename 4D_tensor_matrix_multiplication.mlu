@@ -5,7 +5,7 @@
 #define M_TILE 32
 #define K_TILE 128
 #define L_BLOCK 32
-#define TASK_NUM 96
+#define TASK_NUM 64
 
 __mlu_entry__ void tensor4d_matmul_kernel(
     const float *A,
