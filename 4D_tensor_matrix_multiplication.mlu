@@ -2,15 +2,13 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define M_TILE 32
-#define K_TILE 128
-#define L_BLOCK 32
-#define TASK_NUM 32
+#define M_TILE 64
+#define K_TILE 64
 
 __mlu_entry__ void tensor4d_matmul_kernel(
-    const float *A,
-    const float *B,
-    float *C,
+    const half *A,
+    const half *B,
+    half *C,
     int rows,
     int L,
     int K) {
@@ -19,63 +17,58 @@ __mlu_entry__ void tensor4d_matmul_kernel(
     int col_tiles = (K + K_TILE - 1) / K_TILE;
     int total_tiles = row_tiles * col_tiles;
 
-    __nram__ float accum[M_TILE * K_TILE];
-    __nram__ float a_block[M_TILE * L_BLOCK];
-    __nram__ float b_block[L_BLOCK * K_TILE];
-    __nram__ float prod[M_TILE * K_TILE];
-    __nram__ float a_mat[M_TILE * K_TILE];
-    __nram__ float b_mat[M_TILE * K_TILE];
+    __nram__ float nram_acc[M_TILE * K_TILE];
+    __nram__ float nram_brow[K_TILE];
+    __nram__ float nram_fill[K_TILE];
+    __nram__ half  nram_half[K_TILE];
 
     for (int tile = taskId; tile < total_tiles; tile += taskDim) {
         int row_tile = tile / col_tiles;
-        int col_tile = tile - row_tile * col_tiles;
+        int col_tile = tile % col_tiles;
         int row_start = row_tile * M_TILE;
         int col_start = col_tile * K_TILE;
         int m_size = (row_start + M_TILE <= rows) ? M_TILE : (rows - row_start);
         int k_size = (col_start + K_TILE <= K) ? K_TILE : (K - col_start);
 
-        __bang_write_value(accum, M_TILE * K_TILE, 0.0f);
+        __bang_write_value(nram_acc, M_TILE * K_TILE, 0.0f);
 
-        for (int l_block = 0; l_block < L; l_block += L_BLOCK) {
-            int actual_lb = (l_block + L_BLOCK <= L) ? L_BLOCK : (L - l_block);
-
-            for (int li = 0; li < actual_lb; ++li) {
-                __memcpy(b_block + li * K_TILE,
-                         B + (l_block + li) * K + col_start,
-                         k_size * sizeof(float),
-                         GDRAM2NRAM);
+        for (int li = 0; li < L; ++li) {
+            __memcpy(nram_half,
+                     B + (long long)li * K + col_start,
+                     k_size * sizeof(half),
+                     GDRAM2NRAM);
+            for (int k = 0; k < k_size; ++k) {
+                nram_brow[k] = (float)nram_half[k];
             }
 
             for (int row = 0; row < m_size; ++row) {
-                __memcpy(a_block + row * L_BLOCK,
-                         A + (row_start + row) * L + l_block,
-                         actual_lb * sizeof(float),
+                __memcpy(nram_half,
+                         A + ((long long)(row_start + row) * L + li),
+                         sizeof(half),
                          GDRAM2NRAM);
-            }
+                float av = (float)nram_half[0];
 
-            for (int li = 0; li < actual_lb; ++li) {
-                for (int row = 0; row < m_size; ++row) {
-                    float a_val = a_block[row * L_BLOCK + li];
-                    __bang_write_value(a_mat + row * K_TILE, k_size, a_val);
-                    __memcpy(b_mat + row * K_TILE,
-                             b_block + li * K_TILE,
-                             k_size * sizeof(float),
-                             NRAM2NRAM);
-                }
-
-                __bang_mul(prod, a_mat, b_mat, M_TILE * K_TILE);
-                __bang_add(accum, accum, prod, M_TILE * K_TILE);
+                __bang_write_value(nram_fill, k_size, av);
+                __bang_mul(nram_fill, nram_fill, nram_brow, k_size);
+                __bang_add(nram_acc + row * K_TILE,
+                           nram_acc + row * K_TILE,
+                           nram_fill,
+                           k_size);
             }
         }
 
         for (int row = 0; row < m_size; ++row) {
-            __memcpy(C + (row_start + row) * K + col_start,
-                     accum + row * K_TILE,
-                     k_size * sizeof(float),
+            for (int k = 0; k < k_size; ++k) {
+                nram_half[k] = (half)(nram_acc[row * K_TILE + k]);
+            }
+            __memcpy(C + ((long long)(row_start + row) * K + col_start),
+                     nram_half,
+                     k_size * sizeof(half),
                      NRAM2GDRAM);
         }
     }
 }
+
 
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
@@ -84,35 +77,40 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(B.dim() == 2, "B must be a 2D tensor");
     TORCH_CHECK(A.size(3) == B.size(0), "A.size(3) must equal B.size(0)");
 
-    torch::Tensor A_fp32 = A;
-    torch::Tensor B_fp32 = B;
-    if (A_fp32.scalar_type() != torch::kFloat) {
-        A_fp32 = A_fp32.to(torch::kFloat);
-    }
-    if (B_fp32.scalar_type() != torch::kFloat) {
-        B_fp32 = B_fp32.to(torch::kFloat);
-    }
-
-    int b = (int)A_fp32.size(0);
-    int i = (int)A_fp32.size(1);
-    int j = (int)A_fp32.size(2);
-    int L = (int)A_fp32.size(3);
-    int K = (int)B_fp32.size(1);
+    int b = (int)A.size(0);
+    int i = (int)A.size(1);
+    int j = (int)A.size(2);
+    int L = (int)A.size(3);
+    int K = (int)B.size(1);
     int rows = b * i * j;
 
-    auto C_fp32 = torch::empty({(int64_t)b, (int64_t)i, (int64_t)j, (int64_t)K},
-                               A_fp32.options());
+    torch::Tensor A_half = A;
+    torch::Tensor B_half = B;
+
+    if (A_half.scalar_type() != torch::kHalf) {
+        A_half = A_half.to(torch::kHalf);
+    }
+    if (B_half.scalar_type() != torch::kHalf) {
+        B_half = B_half.to(torch::kHalf);
+    }
+
+    A_half = A_half.contiguous();
+    B_half = B_half.contiguous();
+
+    auto C_half = torch::empty({(int64_t)b, (int64_t)i, (int64_t)j, (int64_t)K},
+                               A_half.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {TASK_NUM, 1, 1};
+    cnrtDim3_t dim = {16, 1, 1};
+    cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_BLOCK;
 
-    tensor4d_matmul_kernel<<<dim, CNRT_FUNC_TYPE_BLOCK, queue>>>(
-        A_fp32.data_ptr<float>(),
-        B_fp32.data_ptr<float>(),
-        C_fp32.data_ptr<float>(),
+    tensor4d_matmul_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<const half*>(A_half.data_ptr()),
+        reinterpret_cast<const half*>(B_half.data_ptr()),
+        reinterpret_cast<half*>(C_half.data_ptr()),
         rows,
         L,
         K);
 
-    return C_fp32;
+    return C_half;
 }
